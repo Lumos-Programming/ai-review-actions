@@ -72,16 +72,23 @@ async function publishReview({ github, context, core, reportJson, model, runAtte
     requireValid(!/^[\/]/.test(f.file) && !/[\\`\r\n]/.test(f.file) &&
       !f.file.split("/").some(p => p === ".." || p === "."), "相対パス");
     requireValid(Number.isInteger(f.line) && f.line > 0, "line");
+    if (evidenceBased) {
+      const ids = f.evidence_step_ids;
+      requireValid(array(ids, 30) && ids.length > 0 && new Set(ids).size === ids.length &&
+        ids.every(id => Number.isInteger(id) && report.investigation.some(step => step.id === id)),
+      "finding.evidence_step_ids");
+    }
   }
 
   // 終了コードやコマンドの成功件数からレビューの良否を推定しない。
-  const blocking = report.findings.some(f => ["critical", "high"].includes(f.severity));
-  const cited = new Set(evidenceBased ? report.assessments.flatMap(a => a.evidence_step_ids) : []);
+  const blocking = evidenceBased && report.findings.some(f => ["critical", "high"].includes(f.severity));
+  const cited = new Set(evidenceBased
+    ? [...report.assessments, ...report.findings].flatMap(item => item.evidence_step_ids) : []);
   const incomplete = !evidenceBased || !report.review_complete || report.limitations.length > 0 ||
     report.assessments.length === 0 || report.assessments.some(a => !a.resolved) ||
     report.not_run_checks.length > 0 ||
-    !report.investigation.some(step => step.tool === "get_pull_request_diff" && step.exit_code === 0) ||
-    report.investigation.some(step => step.exit_code !== 0 && !cited.has(step.id));
+    !report.investigation.some(step => step.tool === "get_pull_request_diff") ||
+    report.investigation.some(step => !cited.has(step.id));
   let event = blocking ? "REQUEST_CHANGES" :
     (report.findings.length > 0 || incomplete ? "COMMENT" : "APPROVE");
 
@@ -97,7 +104,9 @@ async function publishReview({ github, context, core, reportJson, model, runAtte
   }
 
   const order = { critical: 0, high: 1, medium: 2, low: 3 };
-  const findings = [...report.findings].sort((a, b) => order[a.severity] - order[b.severity]);
+  const findings = report.findings.map(finding => ({
+    ...finding, evidence_step_ids: evidenceBased ? finding.evidence_step_ids : [],
+  })).sort((a, b) => order[a.severity] - order[b.severity]);
   const files = findings.length > 0
     ? await github.paginate(github.rest.pulls.listFiles, { ...target, per_page: 100 })
     : [];
@@ -147,6 +156,8 @@ async function publishReview({ github, context, core, reportJson, model, runAtte
 
 // AI出力をコードとして評価せず、意図しないメンション通知も抑制する。
 const safe = value => value.replace(/@/g, "@\u200b");
+const findingEvidence = finding => finding.evidence_step_ids.length > 0
+  ? `\n\n根拠: 観測 ${finding.evidence_step_ids.join(", ")}（レビュー本文の調査ログを参照）` : "";
 const escapeHtml = value => safe(value).replace(/&/g, "&amp;")
   .replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
@@ -175,7 +186,7 @@ function placeFindings(findings, files) {
     if (linesByPath.get(finding.file)?.has(finding.line)) {
       comments.push({
         path: finding.file, line: finding.line, side: "RIGHT",
-        body: `**[${finding.severity}] ${safe(finding.title)}**\n\n${safe(finding.body)}`,
+        body: `**[${finding.severity}] ${safe(finding.title)}**\n\n${safe(finding.body)}` + findingEvidence(finding),
       });
     } else {
       fallbackFindings.push({ ...finding, removed: removedPaths.has(finding.file) });
@@ -225,7 +236,7 @@ function renderReviewBody({
     const codeUrl = `${repoUrl}/blob/${revision}/${path}#L${finding.line}`;
     sections.push("", `### [${finding.severity}] ${safe(finding.title)}`, "",
       `<a href="${escapeHtml(codeUrl)}"><code>${escapeHtml(finding.file)}:L${finding.line}</code></a>`,
-      "", safe(finding.body));
+      "", safe(finding.body) + findingEvidence(finding));
   }
   if (report.limitations.length > 0) {
     sections.push("", "### 未確認の点", "", ...report.limitations.map(value => `- ${safe(value)}`));

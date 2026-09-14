@@ -89,6 +89,55 @@ class ReviewReportTest(unittest.TestCase):
         self.assertEqual(last_line, f"{delimiter}\n")
         self.assertEqual(json.loads(payload), report.model_dump(mode="json"))
 
+    def test_large_observation_logs_do_not_discard_review_conclusions(self) -> None:
+        report = review.ReviewReport(
+            reviewed_head_sha="abc123",
+            review_complete=True,
+            summary="変更内容を確認しました。",
+            limitations=[],
+            verification_rationale="変更箇所を検証しました。",
+            not_run_checks=[],
+            assessments=[
+                review.Assessment(
+                    question="変更した条件で正常に動くか。",
+                    conclusion="境界条件を確認しました。",
+                    evidence_step_ids=[1, 30],
+                    resolved=True,
+                )
+            ],
+            investigation=[
+                review.InvestigationStep(
+                    id=index + 1,
+                    tool="read_file",
+                    purpose="関連実装の確認",
+                    command="read file",
+                    exit_code=0,
+                    result="調" * 900,
+                )
+                for index in range(30)
+            ],
+            findings=[
+                review.Finding(
+                    severity="low",
+                    title="境界条件",
+                    file="example.ts",
+                    line=1,
+                    body="指摘の根拠と修正案",
+                    evidence_step_ids=[1, 30],
+                )
+            ],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "github-output"
+            review.write_github_output(report, output_path)
+            payload = output_path.read_text(encoding="utf-8").split("\n")[1]
+        value = json.loads(payload)
+        self.assertLessEqual(len(payload.encode("utf-8")), 40_000)
+        self.assertEqual(value["findings"], report.model_dump()["findings"])
+        self.assertEqual(value["assessments"], report.model_dump()["assessments"])
+        self.assertEqual([step["id"] for step in value["investigation"]], list(range(1, 31)))
+        self.assertIn("実行ログ", value["investigation"][0]["result"])
+
 
 class ReviewPromptTest(unittest.TestCase):
     def config(self) -> review.ReviewConfig:
@@ -107,12 +156,18 @@ class ReviewPromptTest(unittest.TestCase):
         prompt = review.build_review_prompt(self.config())
 
         self.assertIn("owner/repository", prompt)
-        self.assertIn("PR番号: 42", prompt)
+        self.assertIn("PR number: 42", prompt)
         self.assertIn("Base SHA: base123", prompt)
         self.assertIn("Head SHA: head456", prompt)
-        self.assertIn("すべて日本語で記述", prompt)
-        self.assertIn("ツール呼び出しは最大24回", prompt)
-        self.assertIn("review_completeをfalse", prompt)
+        self.assertIn("Write all user-facing review text in 日本語", prompt)
+        self.assertIn("at most 24 investigation tool calls", prompt)
+        self.assertIn("review_complete=false", prompt)
+        self.assertTrue(review.SYSTEM_INSTRUCTIONS.isascii())
+        english_prompt = review.build_review_prompt(
+            replace(self.config(), review_language="English")
+        )
+        self.assertIn("Write all user-facing review text in English", english_prompt)
+        self.assertTrue(english_prompt.isascii())
 
     def test_next_investigation_step_uses_the_previous_sandbox_output(self) -> None:
         class InvestigationSandbox(CheckoutSandbox):
@@ -181,6 +236,7 @@ class ReviewPromptTest(unittest.TestCase):
                                     "file": "discovered.py",
                                     "line": 1,
                                     "body": "Baseでは正常、Headで回帰することを再現しました。",
+                                    "evidence_step_ids": [1, 2, 3],
                                 }
                             ],
                         },
@@ -307,7 +363,7 @@ class ReviewPromptTest(unittest.TestCase):
                 if isinstance(part, RetryPromptPart)
             ]
             if retries:
-                self.assertIn("実行済みstep_id", str(retries[-1].content))
+                self.assertIn("observed step_ids", str(retries[-1].content))
             return ModelResponse(
                 [
                     ToolCallPart(

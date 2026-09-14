@@ -18,7 +18,7 @@ function report(overrides = {}) {
 }
 
 function finding(severity = "high") {
-  return { severity, title: "不具合", file: "src/example.ts", line: 1, body: "具体的な根拠" };
+  return { severity, title: "不具合", file: "src/example.ts", line: 1, body: "具体的な根拠", evidence_step_ids: [1, 2] };
 }
 
 function evidenceReport(overrides = {}) {
@@ -105,11 +105,30 @@ test("全コマンドの成功では承認せず、未解決の疑問や必要�
   }
 });
 
-test("失敗の観測を解釈せずに完了と申告した場合は承認しない", async () => {
+test("観測を解釈せずに完了と申告した場合は終了コードによらず承認しない", async () => {
+  for (const exit_code of [0, 1, 127]) {
   const h = harness(evidenceReport({ assessments: [{
     question: "変更は安全か。", conclusion: "差分のみ確認しました。", evidence_step_ids: [1], resolved: true,
-  }] }));
+  }], investigation: evidenceReport().investigation.map(step => ({ ...step, exit_code })) }));
   assert.equal((await h.run()).event, "COMMENT");
+  }
+});
+
+test("根拠付きの評価が同じなら終了コードだけで判定を変えない", async () => {
+  for (const exit_code of [0, 1, 127]) {
+    const h = harness(evidenceReport({
+      investigation: evidenceReport().investigation.map(step => ({ ...step, exit_code })),
+    }));
+    assert.equal((await h.run()).event, "APPROVE");
+  }
+});
+
+test("重大な指摘でも実在する観測の根拠がなければ投稿前に拒否する", async () => {
+  for (const evidence_step_ids of [undefined, [], [3], [1, 1]]) {
+    const h = harness(evidenceReport({ findings: [{ ...finding(), evidence_step_ids }] }));
+    await assert.rejects(h.run(), /finding.evidence_step_ids/);
+    assert.deepEqual(h.apiCalls, []);
+  }
 });
 
 test("修正要求は具体的な重大指摘だけから決まり、コマンド失敗だけでは要求しない", async () => {
@@ -163,11 +182,10 @@ test("旧形式の成功記録が30件あっても根拠付き評価なしでは
   assert.equal((await h.run()).event, "COMMENT");
 });
 
-test("重大な指摘は修正要求にし、軽微な指摘と未完了の調査はコメントにする", async () => {
+test("旧形式では重大な指摘でも自動判定せずコメントにする", async () => {
   for (const severity of ["critical", "high", "medium", "low"]) {
     const h = harness(report({ findings: [finding(severity)] }));
-    const expected = ["critical", "high"].includes(severity) ? "REQUEST_CHANGES" : "COMMENT";
-    assert.equal((await h.run()).event, expected);
+    assert.equal((await h.run()).event, "COMMENT");
   }
   for (const changes of [
     { review_complete: false }, { limitations: ["確認できません"] }, { checks: [] },
