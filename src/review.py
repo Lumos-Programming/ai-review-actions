@@ -187,7 +187,7 @@ class DockerSandbox:
             self._image,
             "sh",
             "-lc",
-            "cp -a /source/. /workspace/ && touch /tmp/ready && exec tail -f /dev/null",
+            "cp -R /source/. /workspace/ && touch /tmp/ready && exec tail -f /dev/null",
         ]
         started = subprocess.run(command, capture_output=True, text=True, timeout=180)
         if started.returncode != 0:
@@ -203,8 +203,14 @@ class DockerSandbox:
             if ready.returncode == 0:
                 return self
             time.sleep(0.1)
+        logs = subprocess.run(
+            ["docker", "logs", self._container_name],
+            capture_output=True,
+            text=True,
+        )
+        detail = (logs.stderr or logs.stdout).strip()
         self.close()
-        raise RuntimeError("review sandbox did not become ready")
+        raise RuntimeError(f"review sandbox did not become ready: {detail}")
 
     def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
         self.close()
