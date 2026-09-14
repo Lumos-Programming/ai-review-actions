@@ -93,6 +93,8 @@ async function publishReview({ github, context, core, reportJson, model, runAtte
   };
   let body = renderReviewBody(renderOptions);
   if (Buffer.byteLength(body, "utf8") > 60000) {
+    // 改行をJSONでエスケープし、出力内容がrunnerコマンドとして解釈されることを防ぐ。
+    for (const check of report.checks) core.info(`AI review check: ${JSON.stringify(check)}`);
     body = renderReviewBody({ ...renderOptions, includeLogOutput: false });
   }
   requireValid(Buffer.byteLength(body, "utf8") <= 60000, "投稿本文のサイズ");

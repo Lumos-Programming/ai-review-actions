@@ -24,13 +24,14 @@ function finding(severity = "high") {
 function harness(value = report(), { latest = {}, previous = [], files = [] } = {}) {
   const submitted = [];
   const apiCalls = [];
+  const logs = [];
   const pr = {
     number: 42, head: { sha: "head123" }, base: { sha: "base123" },
     state: "open", draft: false, user: { login: "author" },
   };
   const options = {
     context: { payload: { pull_request: pr }, repo: { owner: "org", repo: "repo" }, runId: 100 },
-    core: { info() {}, notice() {} },
+    core: { info(message) { logs.push(message); }, notice() {} },
     reportJson: JSON.stringify(value), model: "gemini-test", runAttempt: "1",
     serverUrl: "https://github.com",
     github: {
@@ -53,7 +54,7 @@ function harness(value = report(), { latest = {}, previous = [], files = [] } = 
       },
     },
   };
-  return { run: () => publishReview(options), options, submitted, apiCalls };
+  return { run: () => publishReview(options), options, submitted, apiCalls, logs };
 }
 
 test("Unicodeの文字数をPydanticと揃え、上限内の絵文字を含む結果を投稿する", async () => {
@@ -203,4 +204,7 @@ test("エスケープでログが大きくなる場合も投稿上限を守り�
   await h.run();
   assert.ok(Buffer.byteLength(h.submitted[0].body, "utf8") <= 60000);
   assert.ok(h.submitted[0].body.includes("記録が長いため"));
+  const records = h.logs.filter(line => line.startsWith("AI review check: "));
+  assert.equal(records.length, 30);
+  assert.equal(JSON.parse(records[0].slice("AI review check: ".length)).result, "&".repeat(1000));
 });
