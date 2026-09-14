@@ -199,8 +199,22 @@ test("旧形式では重大な指摘でも自動判定せずコメントにす�
 
 test("Draftと同一BotによるPRには承認や修正要求を投稿しない", async () => {
   for (const latest of [{ draft: true }, { user: { login: "github-actions[bot]" } }]) {
-    const h = harness(report({ findings: [finding()] }), { latest });
-    assert.equal((await h.run()).event, "COMMENT");
+    for (const findings of [[], [finding()]]) {
+      const h = harness(evidenceReport({ findings }), { latest });
+      assert.equal((await h.run()).event, "COMMENT");
+    }
+  }
+});
+
+test("GitHub App自身のPRはコメントに限定し、他のBotのPRは根拠に基づき判定する", async () => {
+  for (const login of ["ai-review[bot]", "AI-Review[bot]", "github-actions[bot]", "author"]) {
+    for (const findings of [[], [finding()]]) {
+      const h = harness(evidenceReport({ findings }), { latest: { user: { login } } });
+      h.options.reviewerLogin = "ai-review[bot]";
+      const self = login.toLowerCase() === "ai-review[bot]";
+      assert.equal((await h.run()).event, self ? "COMMENT" : findings.length ? "REQUEST_CHANGES" : "APPROVE");
+      assert.ok(h.submitted[0].body.includes(self ? "**コメント**" : findings.length ? "**変更をリクエスト**" : "**承認**"));
+    }
   }
 });
 
@@ -218,6 +232,27 @@ test("同一実行の重複投稿を防ぐ", async () => {
   });
   assert.equal((await h.run()).published, false);
   assert.deepEqual(h.submitted, []);
+});
+
+test("指定したGitHub Appによる同一実行のレビューだけを重複と判定する", async () => {
+  for (const login of ["ai-review[bot]", "AI-Review[bot]", "github-actions[bot]", "author"]) {
+    const h = harness(evidenceReport(), {
+      previous: [{ user: { login }, body: "<!-- ai-review:100:1 -->" }],
+    });
+    h.options.reviewerLogin = "ai-review[bot]";
+    const duplicate = login.toLowerCase() === "ai-review[bot]";
+    assert.equal((await h.run()).published, !duplicate);
+    assert.equal(h.submitted.length, duplicate ? 0 : 1);
+  }
+});
+
+test("投稿者の設定が不正な場合はAPI呼び出し前に停止する", async () => {
+  for (const reviewerLogin of ["", "[bot]", "ai-review[bot]\n", "someone else", "a".repeat(101), null, 42]) {
+    const h = harness(evidenceReport());
+    h.options.reviewerLogin = reviewerLogin;
+    await assert.rejects(h.run(), /reviewer-login/);
+    assert.deepEqual(h.apiCalls, []);
+  }
 });
 
 test("レビュー本文のメンションを抑制する", async () => {

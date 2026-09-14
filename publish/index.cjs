@@ -1,9 +1,16 @@
 "use strict";
 
-async function publishReview({ github, context, core, reportJson, model, runAttempt, serverUrl }) {
+async function publishReview({ github, context, core, reportJson, model, runAttempt, serverUrl,
+  reviewerLogin = "github-actions[bot]" }) {
   const pr = context.payload.pull_request;
   if (!pr) throw new Error("pull_requestイベントのコンテキストが必要です。");
   const target = { ...context.repo, pull_number: pr.number };
+  if (typeof reviewerLogin !== "string" || reviewerLogin.length > 100 ||
+      !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\[bot\])?$/i.test(reviewerLogin) ||
+      reviewerLogin !== reviewerLogin.trim()) {
+    throw new Error("reviewer-loginに投稿トークンのアカウント名を指定してください。");
+  }
+  const isReviewer = user => user?.login?.toLowerCase() === reviewerLogin.toLowerCase();
   const raw = (reportJson || "").trim();
 
   // 空出力・巨大な出力・不正なJSONでは投稿せず失敗させる。
@@ -97,7 +104,7 @@ async function publishReview({ github, context, core, reportJson, model, runAtte
   const previous = await github.paginate(github.rest.pulls.listReviews, {
     ...target, per_page: 100
   });
-  if (previous.some(r => r.user?.login === "github-actions[bot]" &&
+  if (previous.some(r => isReviewer(r.user) &&
       r.body?.includes(marker))) {
     core.info("この実行のレビューは投稿済みです。");
     return { published: false };
@@ -121,15 +128,16 @@ async function publishReview({ github, context, core, reportJson, model, runAtte
   }
 
   // Draftは調査結果だけを返す。
-  // github-actions自身が作成したPRも、自己承認を避けてCOMMENTにする。
-  if (latest.draft || latest.user.login === "github-actions[bot]") {
+  // 投稿に使うアカウント自身が作成したPRも、自己承認を避けてCOMMENTにする。
+  const commentOnly = latest.draft || isReviewer(latest.user);
+  if (commentOnly) {
     event = "COMMENT";
   }
 
   const renderOptions = {
     report, event, incomplete, fallbackFindings, inlineCount: comments.length,
     context, model, serverUrl, marker,
-    commentOnly: latest.draft || latest.user.login === "github-actions[bot]"
+    commentOnly
   };
   let body = renderReviewBody(renderOptions);
   if (Buffer.byteLength(body, "utf8") > 60000) {

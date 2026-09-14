@@ -149,6 +149,59 @@ checkoutやGemini APIキーは不要です。`github-token`の既定値は`${{ g
 モデルを変更する場合は、調査Actionと投稿Actionの両方へ同じ`model`を指定してください。
 投稿本文の見出しと判定理由は日本語です。
 
+### GitHub App名義で投稿する場合
+
+GitHub Appにリポジトリ権限の`Pull requests: Read and write`を付与し、レビュー対象の
+リポジトリへインストールしてください。checkoutは調査ジョブの`GITHUB_TOKEN`を使うため、
+投稿用Appに`Contents`や`Actions`の書き込み権限は不要です。
+利用側リポジトリのSettings → Secrets and variables → Actionsで、次を登録します。
+
+| 種類 | 名前 | 内容 |
+| --- | --- | --- |
+| Variable | `AI_REVIEW_APP_CLIENT_ID` | GitHub AppのClient ID |
+| Secret | `AI_REVIEW_APP_PRIVATE_KEY` | PEM形式の秘密鍵全体。改行を含めて登録 |
+| Secret | `GEMINI_API_KEY` | 調査ジョブで使用するGemini APIキー |
+
+GitHub FreeのprivateリポジトリではOrg Secrets・Variablesを利用できないため、上記は
+Repository Secrets・Variablesとして登録してください。秘密鍵をリポジトリへコミットしないでください。
+
+投稿ジョブを次のように変更します。調査ジョブへAppの秘密鍵やトークンを渡さず、投稿ジョブでは
+checkoutやモデル生成コマンドの実行を行いません。
+
+```yaml
+  publish:
+    needs: analyze
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions: {}
+    steps:
+      - name: PR投稿用トークンを発行
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.AI_REVIEW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AI_REVIEW_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-pull-requests: write
+
+      - name: GitHub App名義でレビューを投稿
+        uses: ynufes-tech/ai-review-actions/publish@v2
+        with:
+          report: ${{ needs.analyze.outputs.report }}
+          github-token: ${{ steps.app-token.outputs.token }}
+          reviewer-login: ${{ format('{0}[bot]', steps.app-token.outputs.app-slug) }}
+```
+
+トークンの対象はこのリポジトリだけ、権限はPR操作だけに制限し、ジョブ終了時に失効させます。
+`reviewer-login`には投稿トークンと同じアカウントを指定してください。既定値は
+`github-actions[bot]`で、重複投稿の判定と自己承認の防止に使用します。
+Appのインストール先や権限、秘密鍵が正しくない場合は失敗させ、別のトークンへ自動で切り替えません。
+詳細は[公式トークン発行Action](https://github.com/actions/create-github-app-token)と
+[Repository Secrets・Variablesの制約](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets#creating-secrets-for-an-organization)を参照してください。
+
+### 表示と判定
+
 本文には短い要約、指摘、変更内容の評価と根拠、未解決の懸念を表示します。
 コマンドの成功・失敗件数は表示しません。
 調査コマンドと実行結果は折りたたみ、HTMLとして解釈されないコード表示にします。
@@ -165,7 +218,7 @@ JSONの構造・文字数・対象SHAを検証した後、コードで判定し�
 - `critical`または`high`の指摘がある場合は`REQUEST_CHANGES`
 - その他の指摘、未解決の疑問、必要なのに未実行の検証、制約、根拠付きの評価の不足がある場合は`COMMENT`
 - 指摘と未解決の懸念がなく、根拠付きの評価と調査が完了した場合は`APPROVE`
-- Draftと`github-actions[bot]`が作成したPRでは常に`COMMENT`
+- Draftと`reviewer-login`で指定した投稿アカウント自身が作成したPRでは常に`COMMENT`
 
 差分の調査ツールを呼び出していない調査、観測を引用していない解決済み評価は承認できません。
 完了を申告するには、終了コードによらず全観測の意味を評価または指摘に含める必要があります。
@@ -177,7 +230,8 @@ JSONの構造・文字数・対象SHAを検証した後、コードで判定し�
 投稿直前にHead・BaseのSHAとPRが開いていることを確認し、古い結果は投稿しません。
 同一実行・試行のレビューがすでにある場合も投稿を省略します。AI出力は本文としてのみ扱い、
 コードとして評価せず、メンション通知を抑制します。JSONの検証やAPI操作の失敗はジョブの
-失敗として返します。承認を使う場合は、リポジトリ設定でGitHub ActionsによるPR承認を許可してください。
+失敗として返します。既定の`GITHUB_TOKEN`で承認を使う場合は、リポジトリ設定で
+GitHub ActionsによるPR承認を許可してください。GitHub App名義の場合は上記のApp設定を使用します。
 
 出力は`published`（新規投稿時に`true`）、`event`（判定）、`review-url`（投稿URL）です。
 投稿を省略した場合、`published`は`false`、残りの出力は空文字です。

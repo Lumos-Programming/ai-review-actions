@@ -10,6 +10,10 @@ inputs:
     description: pull-requests:write権限を持つGitHubトークン。
     required: false
     default: ${{ github.token }}
+  reviewer-login:
+    description: 投稿トークンのアカウント名。GitHub Appの場合は「app-slug[bot]」を指定します。
+    required: false
+    default: github-actions[bot]
   model:
     description: レビュー本文に表示するモデル名。
     required: false
@@ -36,6 +40,7 @@ runs:
         AI_REVIEW_PUBLISH_PATH: ${{ github.action_path }}
         REVIEW_JSON: ${{ inputs.report }}
         REVIEW_MODEL: ${{ inputs.model }}
+        REVIEWER_LOGIN: ${{ inputs.reviewer-login }}
       with:
         github-token: ${{ inputs.github-token }}
         script: |
@@ -44,6 +49,7 @@ runs:
             github, context, core,
             reportJson: process.env.REVIEW_JSON,
             model: process.env.REVIEW_MODEL,
+            reviewerLogin: process.env.REVIEWER_LOGIN,
             runAttempt: process.env.GITHUB_RUN_ATTEMPT,
             serverUrl: process.env.GITHUB_SERVER_URL
           });
