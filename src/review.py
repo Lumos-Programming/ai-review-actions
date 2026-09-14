@@ -160,7 +160,6 @@ class DockerSandbox:
             "docker",
             "run",
             "--detach",
-            "--rm",
             "--name",
             self._container_name,
             "--network",
