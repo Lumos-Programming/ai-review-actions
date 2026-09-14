@@ -15,7 +15,7 @@ inputs:
     required: false
     default: gemini-3.8-flash
   review-language:
-    description: 要約、制約、指摘の記述言語。
+    description: モデルが生成する要約・指摘・評価などの言語。Action固定の表示文は日本語。
     required: false
     default: 日本語
   repository:
