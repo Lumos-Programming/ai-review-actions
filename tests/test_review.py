@@ -43,6 +43,16 @@ class CheckoutSandbox(FakeSandbox):
 
 
 class ReviewReportTest(unittest.TestCase):
+    def test_rejects_limitations_that_the_publisher_cannot_accept(self) -> None:
+        for value in [" ", "bad\x00text"]:
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                review.ReviewDraft(
+                    review_complete=False,
+                    summary="検証が必要です。",
+                    limitations=[value],
+                    findings=[],
+                )
+
     def test_rejects_a_finding_outside_the_repository(self) -> None:
         with self.assertRaises(ValidationError):
             review.Finding(

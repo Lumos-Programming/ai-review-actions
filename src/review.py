@@ -10,13 +10,22 @@ from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal, Protocol
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AfterValidator, BaseModel, Field, field_validator
 from pydantic_ai import Agent, UsageLimitExceeded, UsageLimits
 from pydantic_ai.models import Model
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.providers.google import GoogleProvider
 
-ShortLimitation = Annotated[str, Field(min_length=1, max_length=500)]
+
+def validate_limitation(value: str) -> str:
+    if not value.strip() or "\x00" in value:
+        raise ValueError("limitation must be non-blank and contain no NUL characters")
+    return value
+
+
+ShortLimitation = Annotated[
+    str, Field(min_length=1, max_length=500), AfterValidator(validate_limitation)
+]
 MAX_REQUEST_LIMIT = 80
 MAX_TOOL_CALL_LIMIT = 30
 MAX_INVESTIGATION_TOOL_LIMIT = 24
