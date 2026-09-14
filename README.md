@@ -5,15 +5,33 @@
 調査やコマンド実行は、Gemini APIキーを保持するオーケストレーターではなく、使い捨ての
 Dockerサンドボックス内で行います。
 
+調査には`ynufes-tech/ai-review-actions`、検証と正式なPR Reviewの投稿には
+`ynufes-tech/ai-review-actions/publish`を使用します。モデルAPIキーを持つ調査ジョブと、
+`pull-requests: write`権限を持つ投稿ジョブを分離して利用してください。
+
 ## 使い方
 
 checkoutにはBaseとHeadの両方のコミットが必要です。次の例のActionリビジョンは説明用です。
 本番ワークフローでは、検証済みの完全なコミットSHAへ固定してください。
 
 ```yaml
+name: AI PR Review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+permissions: {}
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
-  review:
+  analyze:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      github.actor != 'dependabot[bot]'
     permissions:
       contents: read
     outputs:
@@ -36,6 +54,17 @@ jobs:
           base-sha: ${{ github.event.pull_request.base.sha }}
           head-sha: ${{ github.event.pull_request.head.sha }}
           source-directory: source
+
+  publish:
+    needs: analyze
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: ynufes-tech/ai-review-actions/publish@v1
+        with:
+          report: ${{ needs.analyze.outputs.report }}
 ```
 
 レビュー文の既定言語は日本語です。別の言語が必要な場合は`review-language`を指定してください。
@@ -74,6 +103,31 @@ Actionはcheckoutが指定されたHead SHAと一致することを検証し、`
 設定します。実行済みの`checks`もモデルの申告を信用せず、ツールの実行結果から記録します。
 必要だが実行できなかった検証は、モデルが`not_run`として申告し、Pydanticで検証します。
 
+文字列の上限はUnicodeコードポイント数で数えます。絵文字を含む場合も、調査側と投稿側の
+上限判定は一致します。
+
+## レビューの投稿
+
+`publish` Actionは`pull_request`イベントのコンテキストと`report`入力を使用します。
+checkoutやGemini APIキーは不要です。`github-token`の既定値は`${{ github.token }}`です。
+モデルを変更する場合は、調査Actionと投稿Actionの両方へ同じ`model`を指定してください。
+投稿本文の見出しと判定理由は日本語です。
+
+JSONの構造・文字数・対象SHAを検証した後、コードで判定します。
+
+- `critical`または`high`の指摘がある場合は`REQUEST_CHANGES`
+- その他の指摘、未完了の調査、制約、失敗・未実行の検証がある場合は`COMMENT`
+- 指摘と制約がなく、調査・検証が完了した場合は`APPROVE`
+- Draftと`github-actions[bot]`が作成したPRでは常に`COMMENT`
+
+投稿直前にHead・BaseのSHAとPRが開いていることを確認し、古い結果は投稿しません。
+同一実行・試行のレビューがすでにある場合も投稿を省略します。AI出力は本文としてのみ扱い、
+コードとして評価せず、メンション通知を抑制します。JSONの検証やAPI操作の失敗はジョブの
+失敗として返します。承認を使う場合は、リポジトリ設定でGitHub ActionsによるPR承認を許可してください。
+
+出力は`published`（新規投稿時に`true`）、`event`（判定）、`review-url`（投稿URL）です。
+投稿を省略した場合、`published`は`false`、残りの出力は空文字です。
+
 ## 使用上限
 
 既定値では、モデルリクエストを80回、ツール呼び出しを30回まで許可します。モデルには
@@ -81,6 +135,9 @@ Actionはcheckoutが指定されたHead SHAと一致することを検証し、`
 先にPydantic AIの使用上限へ到達した場合は、調査結果をすべて破棄せず未完了のレポートを返します。
 
 `request-limit`、`tool-call-limit`、`investigation-tool-limit`では、これらの上限を引き下げられます。
+
+モデルや依存パッケージのバージョンについて、学習済み知識だけによる存在・互換性の断定は
+指摘から除外するよう指示します。必要な外部情報を確認できない場合は制約へ記録します。
 
 ## サンドボックス
 
@@ -111,7 +168,8 @@ uv run ruff format --check .
 uv run ruff check .
 uv run ty check src tests
 uv run python tests/test_review.py
+node --test tests/test_publish.cjs
 RUN_DOCKER_TESTS=1 uv run python tests/test_review.py DockerSandboxTest
 ```
 
-Dockerテストには、起動中のDockerデーモンが必要です。
+投稿処理のテストにはNode.js 22以降、Dockerテストには起動中のDockerデーモンが必要です。

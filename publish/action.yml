@@ -1,0 +1,52 @@
+name: AIレビュー結果を投稿
+description: 検証済みのAIレビューJSONから判定し、対象コミットへ正式なPR Reviewを投稿します。
+author: ynufes-tech
+
+inputs:
+  report:
+    description: 調査Actionが返したJSONレポート。
+    required: true
+  github-token:
+    description: pull-requests:write権限を持つGitHubトークン。
+    required: false
+    default: ${{ github.token }}
+  model:
+    description: レビュー本文に表示するモデル名。
+    required: false
+    default: gemini-3.8-flash
+
+outputs:
+  published:
+    description: この実行で新しいレビューを投稿した場合はtrue。
+    value: ${{ steps.publish.outputs.published }}
+  event:
+    description: 投稿したレビューの判定（APPROVE・COMMENT・REQUEST_CHANGES）。投稿を省略した場合は空文字。
+    value: ${{ steps.publish.outputs.event }}
+  review-url:
+    description: 投稿したレビューのURL。投稿を省略した場合は空文字。
+    value: ${{ steps.publish.outputs.review-url }}
+
+runs:
+  using: composite
+  steps:
+    - name: JSONを検証してPR Reviewを投稿
+      id: publish
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+      env:
+        AI_REVIEW_PUBLISH_PATH: ${{ github.action_path }}
+        REVIEW_JSON: ${{ inputs.report }}
+        REVIEW_MODEL: ${{ inputs.model }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const { publishReview } = require(process.env.AI_REVIEW_PUBLISH_PATH + "/index.cjs");
+          const result = await publishReview({
+            github, context, core,
+            reportJson: process.env.REVIEW_JSON,
+            model: process.env.REVIEW_MODEL,
+            runAttempt: process.env.GITHUB_RUN_ATTEMPT,
+            serverUrl: process.env.GITHUB_SERVER_URL
+          });
+          core.setOutput("published", String(result.published));
+          core.setOutput("event", result.event || "");
+          core.setOutput("review-url", result.reviewUrl || "");
