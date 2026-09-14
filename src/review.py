@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
@@ -11,7 +12,7 @@ from typing import Annotated, Any, Literal, Protocol
 from uuid import uuid4
 
 from pydantic import AfterValidator, BaseModel, Field, field_validator
-from pydantic_ai import Agent, UsageLimitExceeded, UsageLimits
+from pydantic_ai import Agent, ModelRetry, UsageLimitExceeded, UsageLimits
 from pydantic_ai.models import Model
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.providers.google import GoogleProvider
@@ -119,17 +120,26 @@ class Finding(BaseModel):
         return value
 
 
-class ReviewCheck(BaseModel):
-    command: str = Field(min_length=1, max_length=500)
-    status: Literal["passed", "failed", "not_run"]
+class InvestigationStep(BaseModel):
+    id: int = Field(ge=1, le=MAX_TOOL_CALL_LIMIT)
+    tool: Literal[
+        "get_pull_request_diff", "list_directory", "read_file", "search_text", "run_command"
+    ]
+    purpose: ShortLimitation
+    command: str = Field(min_length=1, max_length=2_100)
+    exit_code: int
     result: str = Field(min_length=1, max_length=1_000)
 
-    @field_validator("command", "result")
-    @classmethod
-    def reject_blank_text(cls, value: str) -> str:
-        if not value.strip() or "\x00" in value:
-            raise ValueError("text must be non-blank and contain no NUL characters")
-        return value
+
+class Assessment(BaseModel):
+    question: ShortLimitation
+    conclusion: Annotated[
+        str, Field(min_length=1, max_length=1_000), AfterValidator(validate_limitation)
+    ]
+    evidence_step_ids: list[Annotated[int, Field(ge=1, le=MAX_TOOL_CALL_LIMIT)]] = Field(
+        max_length=MAX_TOOL_CALL_LIMIT
+    )
+    resolved: bool
 
 
 class NotRunCheck(BaseModel):
@@ -149,6 +159,8 @@ class ReviewDraft(BaseModel):
     summary: str = Field(min_length=1, max_length=1_500)
     limitations: list[ShortLimitation] = Field(max_length=10)
     not_run_checks: list[NotRunCheck] = Field(default_factory=list, max_length=6)
+    verification_rationale: ShortLimitation = "検証方針が報告されていません。"
+    assessments: list[Assessment] = Field(default_factory=list, max_length=8)
     findings: list[Finding] = Field(max_length=5)
 
     @field_validator("summary")
@@ -160,12 +172,15 @@ class ReviewDraft(BaseModel):
 
 
 class ReviewReport(BaseModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     reviewed_head_sha: str = Field(min_length=1)
     review_complete: bool
     summary: str = Field(min_length=1, max_length=1_500)
     limitations: list[ShortLimitation] = Field(max_length=10)
-    checks: list[ReviewCheck] = Field(max_length=30)
+    investigation: list[InvestigationStep] = Field(max_length=MAX_TOOL_CALL_LIMIT)
+    verification_rationale: ShortLimitation
+    assessments: list[Assessment] = Field(max_length=8)
+    not_run_checks: list[NotRunCheck] = Field(max_length=6)
     findings: list[Finding] = Field(max_length=5)
 
 
@@ -327,7 +342,7 @@ class ReviewTools:
         self._sandbox = sandbox
         self._base_sha = base_sha
         self._head_sha = head_sha
-        self.checks: list[ReviewCheck] = []
+        self.steps: list[InvestigationStep] = []
 
     def get_pull_request_diff(self, path: str | None = None) -> str:
         """Pull Requestの差分を返す。リポジトリ相対パスで対象を限定できる。"""
@@ -341,13 +356,15 @@ class ReviewTools:
         ]
         if path is not None:
             command.extend(["--", self._repository_path(path)])
-        return self._execute(command)
+        return self._execute("get_pull_request_diff", "PRの変更内容を確認する。", command)
 
     def list_directory(self, path: str = ".", depth: int = 2) -> str:
         """リポジトリ相対ディレクトリ内のファイルを最大4階層まで一覧表示する。"""
         safe_path = self._repository_path(path)
         safe_depth = max(1, min(depth, 4))
         return self._execute(
+            "list_directory",
+            "関連する実装・設定・テストの所在を確認する。",
             [
                 "find",
                 safe_path,
@@ -356,7 +373,7 @@ class ReviewTools:
                 "-maxdepth",
                 str(safe_depth),
                 "-print",
-            ]
+            ],
         )
 
     def read_file(self, path: str, start_line: int = 1, end_line: int = 400) -> str:
@@ -364,7 +381,11 @@ class ReviewTools:
         safe_path = self._repository_path(path)
         if start_line < 1 or end_line < start_line or end_line - start_line >= 400:
             raise ValueError("line range must contain between 1 and 400 lines")
-        return self._execute(["sed", "-n", f"{start_line},{end_line}p", "--", safe_path])
+        return self._execute(
+            "read_file",
+            "関連するコードの内容を確認する。",
+            ["sed", "-n", f"{start_line},{end_line}p", "--", safe_path],
+        )
 
     def search_text(self, pattern: str, path: str = ".") -> str:
         """追跡対象のテキストから固定文字列を検索し、一致した行を返す。"""
@@ -372,35 +393,49 @@ class ReviewTools:
         if not pattern or len(pattern) > 500 or "\x00" in pattern:
             raise ValueError("pattern must contain between 1 and 500 safe characters")
         return self._execute(
+            "search_text",
+            "関連する定義や呼び出し元を調べる。",
             ["git", "grep", "-n", "-I", "-F", "-e", pattern, "--", safe_path],
-            successful_exit_codes={0, 1},
         )
 
-    def run_command(self, command: str, timeout_seconds: int = 120) -> str:
-        """分離workspace内で対象を絞った調査またはテストコマンドを実行する。"""
+    def run_command(
+        self, command: str, purpose: ShortLimitation, timeout_seconds: int = 120
+    ) -> str:
+        """調べたい疑問と、このコマンドが適切な理由をpurposeに記してから実行する。"""
         if not command.strip() or len(command) > 2_000 or "\x00" in command:
             raise ValueError("command must contain between 1 and 2000 safe characters")
         safe_timeout = max(1, min(timeout_seconds, 120))
-        return self._execute(["sh", "-lc", command], safe_timeout)
+        return self._execute("run_command", purpose, ["sh", "-lc", command], safe_timeout)
 
     def _execute(
         self,
+        tool: Literal[
+            "get_pull_request_diff", "list_directory", "read_file", "search_text", "run_command"
+        ],
+        purpose: str,
         command: list[str],
         timeout_seconds: int = 120,
-        successful_exit_codes: set[int] | None = None,
     ) -> str:
+        if len(self.steps) >= MAX_TOOL_CALL_LIMIT:
+            raise UsageLimitExceeded("investigation record limit reached")
         result = self._sandbox.execute(command, timeout_seconds)
-        rendered = self._render_result(result)
-        successful_exit_codes = successful_exit_codes or {0}
-        if len(self.checks) < 30:
-            self.checks.append(
-                ReviewCheck(
-                    command=shlex.join(command)[:500],
-                    status=("passed" if result.exit_code in successful_exit_codes else "failed"),
-                    result=rendered[:1_000],
-                )
-            )
-        return rendered
+        rendered = self._render_result(result).replace("\x00", "\\0")
+        step = InvestigationStep(
+            id=len(self.steps) + 1,
+            tool=tool,
+            purpose=purpose,
+            command=shlex.join(command)[:2_100],
+            exit_code=result.exit_code,
+            result=DockerSandbox._truncate(rendered, 900),
+        )
+        self.steps.append(step)
+        # 改行をJSONエスケープし、リポジトリ由来の出力をrunner命令として解釈させない。
+        print(
+            "AI investigation: "
+            + json.dumps({**step.model_dump(), "result": rendered}, ensure_ascii=False),
+            flush=True,
+        )
+        return f"[step_id={step.id}]\n{rendered}"
 
     @staticmethod
     def _repository_path(path: str) -> str:
@@ -457,9 +492,15 @@ Head SHA: {config.head_sha}
 ## 調査手順
 1. get_pull_request_diffで変更の全体像と差分を確認する。
 2. 差分だけでなく、呼び出し元、関連実装、設定、既存テストを調べる。
-3. 必要に応じてrun_commandで対象を絞ったテストや再現コードを実行する。
-4. 失敗した場合、既存の問題か今回の変更による回帰かを区別する。
-5. 重要度の高いものから最大5件、根拠のある指摘だけを返す。
+3. 各ツールの実際の出力を読んで、次に調べる疑問・対象・方法を選ぶ。
+   結果に依存するコマンドを、結果を見る前にまとめて計画・実行しない。
+4. run_commandの前に、変更に関係する疑問、静的な確認だけでは足りない理由、
+   利用可能なツール・依存関係・ネットワークなしという制約を踏まえ、実行が適切か判断する。
+   purposeにはその疑問とコマンドを選んだ理由を簡潔に記述する。
+   任意ツールがなければ、利用可能な代替手段や静的調査で疑問を解消できるか検討する。
+5. 実行結果を解釈し、必要なら再現条件を絞る、関連コードを読む、Baseと比較するなど、
+   観測に応じて調査を続ける。既存の問題・環境の不足・今回の回帰を区別する。
+6. 重要度の高いものから最大5件、根拠のある指摘だけを返す。
 
 調査用のツール呼び出しは最大{config.investigation_tool_limit}回です。
 最終結果を生成する余裕を必ず残してください。
@@ -480,17 +521,31 @@ severityは次のいずれかです。
 
 ## 完了判定
 review_completeは、変更範囲と必要な関連実装の調査が完了した場合だけtrueにしてください。
-差分の読み切り不足、ツールエラー、時間不足、必要な検証を実行できない場合はfalseです。
-テストの失敗を「問題なし」に変換しないでください。
+差分の読み切り不足、時間不足、必要な検証を代替手段でも完了できない場合はfalseです。
+コマンドの終了コードや成功件数はレビュー判定の根拠ではありません。
+ファイルを読めたことは正しさの証明ではなく、任意ツールの探索失敗や検索の一致なしは
+不具合や未完了を意味しません。テストが成功しても、関連する条件を検証したか解釈してください。
+失敗したテストは無視せず、回帰か既存の問題か、疑問を解消できたか説明してください。
 検証コマンドの失敗を「|| true」などで成功扱いにしないでください。
-必要だが実行していない検証は、理由とともにnot_run_checksへ記録してください。
+本当に必要で、代替調査でも補えていない未実行の検証だけをnot_run_checksへ記録してください。
+使わなかった任意ツールの一覧にはしないでください。
 未解決の制約がない場合だけlimitationsを空配列にしてください。
+
+verification_rationaleには、この変更に対して選んだ検証方法が適切な理由を短く記述してください。
+実行検証が不要なら、静的な調査で判断できる理由を記述してください。
+assessmentsには、変更に関わる主要な疑問(question)、観測から得た短い結論(conclusion)、
+根拠となるツール結果のstep_id(evidence_step_ids)、調査上の疑問が解消したか(resolved)を記録します。
+長い思考過程ではなく、観測事実と結論の要約だけを記述してください。
+実行結果に問題がなくても、内容に基づくassessmentがなければレビュー完了にはできません。
+終了コードが0以外の観測は、任意ツール不足や一致なしを含め、その意味をassessmentで説明してください。
+resolvedは「コードに問題がない」ではなく「根拠を得て判断できた」を意味します。
+回帰を確認してfindingへ記載した疑問もresolved=trueにできます。
 
 各findingのfileはリポジトリ内の相対パス、lineは1始まりの行番号です。
 summaryは結果、主要な懸念、未検証の点を中心に3文・500文字程度までで簡潔に記述してください。
 調査手順やファイル内容、設定項目の列挙はsummaryへ含めないでください。
 承認やマージ可否の判定は投稿側のコードが行うため、「マージ可能」「承認します」などの
-推奨をsummaryに書かないでください。失敗・未実行の検証がある場合に検証完了と書かないでください。
+推奨をsummaryに書かないでください。必要な検証が未解決の場合に検証完了と書かないでください。
 bodyには問題、発生条件・影響、根拠、修正案を短い2〜4段落で記載してください。
 GitHubのインラインレビューとして読みやすくし、定型の見出しを繰り返さないでください。
 指摘がない場合はfindingsを空配列にしてください。
@@ -516,11 +571,34 @@ def review_pull_request(
         tool_timeout=130,
         model_settings=GoogleModelSettings(temperature=0.1, timeout=180),
     )
-    agent.tool_plain(tools.get_pull_request_diff)
-    agent.tool_plain(tools.list_directory)
-    agent.tool_plain(tools.read_file)
-    agent.tool_plain(tools.search_text)
-    agent.tool_plain(tools.run_command)
+    # 同じworkspaceを操作するツールを直列化し、観測IDと変更の順序を安定させる。
+    agent.tool_plain(sequential=True)(tools.get_pull_request_diff)
+    agent.tool_plain(sequential=True)(tools.list_directory)
+    agent.tool_plain(sequential=True)(tools.read_file)
+    agent.tool_plain(sequential=True)(tools.search_text)
+    agent.tool_plain(sequential=True)(tools.run_command)
+
+    @agent.output_validator
+    def validate_evidence(draft: ReviewDraft) -> ReviewDraft:
+        available = {step.id for step in tools.steps}
+        cited: set[int] = set()
+        for assessment in draft.assessments:
+            ids = assessment.evidence_step_ids
+            if len(ids) != len(set(ids)) or not set(ids) <= available:
+                raise ModelRetry(
+                    "evidence_step_idsには実行済みstep_idを重複なしで指定してください。"
+                )
+            if assessment.resolved and not ids:
+                raise ModelRetry("解決済みのassessmentには観測の根拠が必要です。")
+            cited.update(ids)
+        if draft.review_complete:
+            unexplained = {step.id for step in tools.steps if step.exit_code != 0} - cited
+            if unexplained:
+                raise ModelRetry(
+                    f"終了コードが0以外の観測{sorted(unexplained)}を解釈し、"
+                    "assessmentへ根拠と結論を記録してください。"
+                )
+        return draft
 
     try:
         result = agent.run_sync(
@@ -531,45 +609,46 @@ def review_pull_request(
             ),
         )
         draft = result.output
+        print(f"AI investigation model requests: {result.usage.requests}", flush=True)
     except UsageLimitExceeded as error:
-        checks = tools.checks or [
-            ReviewCheck(
-                command="調査ツール",
-                status="not_run",
-                result="使用上限に達する前に調査コマンドを完了できませんでした。",
-            )
-        ]
         return ReviewReport(
             reviewed_head_sha=config.head_sha,
             review_complete=False,
             summary="設定した使用上限に達したため、コードレビューを完了できませんでした。",
             limitations=[f"Pydantic AIの使用上限に達しました: {str(error)[:430]}"],
-            checks=checks,
+            investigation=tools.steps,
+            verification_rationale="使用上限に達し、必要な検証の評価を完了できませんでした。",
+            assessments=[],
+            not_run_checks=[],
             findings=[],
         )
 
     limitations = list(draft.limitations)
     review_complete = draft.review_complete
-    if not tools.checks:
+    if not any(
+        step.tool == "get_pull_request_diff" and step.exit_code == 0 for step in tools.steps
+    ):
         review_complete = False
-        limitations.append("調査ツールが実行されていないため、レビューを完了扱いにできません。")
-
-    not_run_checks = [
-        ReviewCheck(command=check.command, status="not_run", result=check.result)
-        for check in draft.not_run_checks
-    ]
-    executed_capacity = 30 - len(not_run_checks)
-    checks = tools.checks[:executed_capacity] + not_run_checks
-    if len(tools.checks) > executed_capacity:
+        limitations.append(
+            "調査ツールによる差分の取得を確認できず、レビューを完了扱いにできません。"
+        )
+    if not draft.assessments or draft.verification_rationale == "検証方針が報告されていません。":
         review_complete = False
-        limitations.append("checksの上限により、一部の実行記録を結果へ含められませんでした。")
+        limitations.append("観測に基づく評価と検証方針が揃っていないため、レビューは未完了です。")
+    if any(not assessment.resolved for assessment in draft.assessments) or draft.not_run_checks:
+        review_complete = False
+    if limitations:
+        review_complete = False
 
     return ReviewReport(
         reviewed_head_sha=config.head_sha,
         review_complete=review_complete,
         summary=draft.summary,
         limitations=limitations[:10],
-        checks=checks,
+        investigation=tools.steps,
+        verification_rationale=draft.verification_rationale,
+        assessments=draft.assessments,
+        not_run_checks=draft.not_run_checks,
         findings=draft.findings,
     )
 
@@ -613,7 +692,7 @@ def main() -> None:
     write_github_output(report, output_path)
     print(
         f"Review complete={report.review_complete}; "
-        f"checks={len(report.checks)}; findings={len(report.findings)}"
+        f"assessments={len(report.assessments)}; findings={len(report.findings)}"
     )
 
 

@@ -46,7 +46,7 @@ jobs:
           path: source
 
       - id: review
-        uses: ynufes-tech/ai-review-actions@v1
+        uses: ynufes-tech/ai-review-actions@v2
         with:
           gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
           repository: ${{ github.repository }}
@@ -62,7 +62,7 @@ jobs:
     permissions:
       pull-requests: write
     steps:
-      - uses: ynufes-tech/ai-review-actions/publish@v1
+      - uses: ynufes-tech/ai-review-actions/publish@v2
         with:
           report: ${{ needs.analyze.outputs.report }}
 ```
@@ -75,18 +75,39 @@ jobs:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "reviewed_head_sha": "コミットSHA",
   "review_complete": true,
   "summary": "レビューの要約",
   "limitations": [],
-  "checks": [
+  "verification_rationale": "変更した分岐のコードを読み、対象条件の再現で回帰を確認しました。",
+  "assessments": [
     {
-      "command": "git diff base...head",
-      "status": "passed",
-      "result": "記録されたコマンド結果"
+      "question": "空の入力でも正常に処理できるか。",
+      "conclusion": "空の入力で例外になる回帰を確認したため、指摘に記載しました。",
+      "evidence_step_ids": [1, 2],
+      "resolved": true
     }
   ],
+  "investigation": [
+    {
+      "id": 1,
+      "tool": "get_pull_request_diff",
+      "purpose": "PRの変更内容を確認する。",
+      "command": "git diff base...head",
+      "exit_code": 0,
+      "result": "変更された分岐の差分"
+    },
+    {
+      "id": 2,
+      "tool": "run_command",
+      "purpose": "変更した分岐が空の入力に対応しているか、再現で確認する。",
+      "command": "node reproduce.mjs",
+      "exit_code": 1,
+      "result": "空の入力で例外が発生した再現結果"
+    }
+  ],
+  "not_run_checks": [],
   "findings": [
     {
       "severity": "high",
@@ -100,8 +121,17 @@ jobs:
 ```
 
 Actionはcheckoutが指定されたHead SHAと一致することを検証し、`reviewed_head_sha`を自身で
-設定します。実行済みの`checks`もモデルの申告を信用せず、ツールの実行結果から記録します。
-必要だが実行できなかった検証は、モデルが`not_run`として申告し、Pydanticで検証します。
+設定します。`investigation`はツールの実行結果から記録する観測ログであり、合否の採点表では
+ありません。コマンドの成功件数・終了コードからレビューの良否を決めません。
+
+`assessments`は変更に関わる疑問と、観測事実に基づく短い結論です。`evidence_step_ids`は
+実行済みの観測IDだけを参照でき、解決済みの評価には根拠が必要です。`resolved`は
+「不具合がない」ではなく「判断に必要な調査を終えた」を表します。再現した回帰も評価は
+解決済みにでき、その問題自体は`findings`へ記載します。
+
+`verification_rationale`には選んだ検証方法が適切な理由を記載します。静的調査で判断できる
+変更では、実行テストがなくても構いません。必要なのに代替手段でも補えていない検証だけを
+`not_run_checks`へ理由付きで記録します。任意ツールの不足は、それ自体では未完了の理由にしません。
 
 文字列の上限はUnicodeコードポイント数で数えます。絵文字を含む場合も、調査側と投稿側の
 上限判定は一致します。
@@ -113,7 +143,8 @@ checkoutやGemini APIキーは不要です。`github-token`の既定値は`${{ g
 モデルを変更する場合は、調査Actionと投稿Actionの両方へ同じ`model`を指定してください。
 投稿本文の見出しと判定理由は日本語です。
 
-本文には短い要約、指摘件数、検証の成功・失敗・未実行件数を表示します。
+本文には短い要約、指摘、変更内容の評価と根拠、未解決の懸念を表示します。
+コマンドの成功・失敗件数は表示しません。
 調査コマンドと実行結果は折りたたみ、HTMLとして解釈されないコード表示にします。
 表示用のエスケープで本文サイズが上限を超える場合は、各記録をJSON形式で実行ログへ明示的に
 出力し、本文の詳細をその実行ログへのリンクへ置き換えます。
@@ -126,9 +157,15 @@ GitHubのPR差分に対応する指摘は、該当行へのインラインコメ
 JSONの構造・文字数・対象SHAを検証した後、コードで判定します。
 
 - `critical`または`high`の指摘がある場合は`REQUEST_CHANGES`
-- その他の指摘、未完了の調査、制約、失敗・未実行の検証がある場合は`COMMENT`
-- 指摘と制約がなく、調査・検証が完了した場合は`APPROVE`
+- その他の指摘、未解決の疑問、必要なのに未実行の検証、制約、根拠付きの評価の不足がある場合は`COMMENT`
+- 指摘と未解決の懸念がなく、根拠付きの評価と調査が完了した場合は`APPROVE`
 - Draftと`github-actions[bot]`が作成したPRでは常に`COMMENT`
+
+差分を取得していない調査、観測を引用していない解決済み評価は承認できません。
+終了コードが0以外の観測は、その意味を評価に含める必要があります。たとえば検索の一致なし、
+任意ツールの不足、既存テストの失敗と今回の回帰を区別します。終了コード自体を合否の根拠にはしません。
+ただし、参照先IDが正しくても、モデルによる結論の正しさまで機械的に保証できるわけではありません。
+通常のCIや人間のレビューを置き換えるものではありません。
 
 投稿直前にHead・BaseのSHAとPRが開いていることを確認し、古い結果は投稿しません。
 同一実行・試行のレビューがすでにある場合も投稿を省略します。AI出力は本文としてのみ扱い、
@@ -137,6 +174,33 @@ JSONの構造・文字数・対象SHAを検証した後、コードで判定し�
 
 出力は`published`（新規投稿時に`true`）、`event`（判定）、`review-url`（投稿URL）です。
 投稿を省略した場合、`published`は`false`、残りの出力は空文字です。
+
+## v1からの移行
+
+調査Actionと投稿Actionを同じv2のコミットSHAへ更新してください。入力名・ジョブ分離・
+サンドボックスの権限は変更していません。JSON出力は`schema_version: 2`となり、旧`checks`を
+`investigation`、`assessments`、`verification_rationale`、`not_run_checks`へ置き換えています。
+独自にJSONを読む処理がある場合は対応が必要です。
+
+v2の投稿Actionは旧形式も読み取れますが、根拠付きの評価がないため自動承認はしません。
+重大な指摘があれば変更要求、それ以外はコメントとして投稿します。既存のv1タグは変更しません。
+
+## 観測に応じた反復調査
+
+Pydantic AIは「モデルがツールを選ぶ → サンドボックスで実行 → 実際の出力をモデルへ返す →
+次の調査を選ぶ」を最終レポートまで繰り返します。コマンド一覧を一度生成して実行するだけの
+構成ではありません。同じworkspaceを操作するツールは直列実行します。
+
+`run_command`では調べたい疑問とコマンドを選んだ理由を`purpose`として指定します。
+モデルは利用可能なツール・依存関係・制約を考慮して、実行が必要か、静的調査や代替手段で
+判断できるかを評価します。出力を見てから関連ファイルを読む、再現条件を絞る、Baseと比較するなど、
+観測に応じて次の操作を選ぶよう指示しています。
+
+各観測は`AI investigation:`という接頭辞のJSONとして実行ログに記録します。本文には短い抜粋を
+残し、ログにはサンドボックスの出力上限内の結果を記録します。最終的なモデルリクエスト数も
+ログに記録しますが、これは調査の追跡用であり、品質の点数ではありません。
+テストでは、前の出力で初めて分かるファイルと再現コマンドを次のモデル応答が選ぶこと、
+任意ツールの失敗と必要な未解決の検証を区別することを確認しています。
 
 ## 使用上限
 

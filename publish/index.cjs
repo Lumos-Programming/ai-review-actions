@@ -23,19 +23,46 @@ async function publishReview({ github, context, core, reportJson, model, runAtte
   };
 
   requireValid(object(report), "ルートオブジェクト");
-  requireValid(report.schema_version === 1, "schema_version");
+  requireValid([1, 2].includes(report.schema_version), "schema_version");
+  const evidenceBased = report.schema_version === 2;
   requireValid(report.reviewed_head_sha === pr.head.sha, "対象SHAの不一致");
   requireValid(typeof report.review_complete === "boolean", "review_complete");
   requireValid(text(report.summary, 1500), "summary");
   requireValid(array(report.limitations, 10), "limitations");
   requireValid(report.limitations.every(v => text(v, 500)), "limitationsの内容");
-  requireValid(array(report.checks, 30), "checks");
   requireValid(array(report.findings, 5), "findings");
 
-  for (const c of report.checks) {
-    requireValid(object(c), "check");
-    requireValid(text(c.command, 500) && text(c.result, 1000), "checkの内容");
-    requireValid(["passed", "failed", "not_run"].includes(c.status), "check.status");
+  if (evidenceBased) {
+    requireValid(text(report.verification_rationale, 500), "verification_rationale");
+    requireValid(array(report.investigation, 30), "investigation");
+    requireValid(array(report.assessments, 8), "assessments");
+    requireValid(array(report.not_run_checks, 6), "not_run_checks");
+    const toolNames = ["get_pull_request_diff", "list_directory", "read_file", "search_text", "run_command"];
+    for (const [index, step] of report.investigation.entries()) {
+      requireValid(object(step) && step.id === index + 1, "investigation.id");
+      requireValid(toolNames.includes(step.tool) && Number.isInteger(step.exit_code), "investigation.tool/exit_code");
+      requireValid(text(step.purpose, 500) && text(step.command, 2100) && text(step.result, 1000), "investigationの内容");
+    }
+    const stepIds = new Set(report.investigation.map(step => step.id));
+    for (const assessment of report.assessments) {
+      requireValid(object(assessment), "assessment");
+      requireValid(text(assessment.question, 500) && text(assessment.conclusion, 1000), "assessmentの内容");
+      requireValid(typeof assessment.resolved === "boolean", "assessment.resolved");
+      const ids = assessment.evidence_step_ids;
+      requireValid(array(ids, 30) && new Set(ids).size === ids.length &&
+        ids.every(id => Number.isInteger(id) && stepIds.has(id)), "assessment.evidence_step_ids");
+      requireValid(!assessment.resolved || ids.length > 0, "解決済み評価の根拠");
+    }
+    for (const check of report.not_run_checks) {
+      requireValid(object(check) && text(check.command, 500) && text(check.result, 1000), "not_run_check");
+    }
+  } else {
+    requireValid(array(report.checks, 30), "checks");
+    for (const c of report.checks) {
+      requireValid(object(c), "check");
+      requireValid(text(c.command, 500) && text(c.result, 1000), "checkの内容");
+      requireValid(["passed", "failed", "not_run"].includes(c.status), "check.status");
+    }
   }
   for (const f of report.findings) {
     requireValid(object(f), "finding");
@@ -47,10 +74,14 @@ async function publishReview({ github, context, core, reportJson, model, runAtte
     requireValid(Number.isInteger(f.line) && f.line > 0, "line");
   }
 
-  // 判定はモデルの自由文ではなく、このコードで決定する。
+  // 終了コードやコマンドの成功件数からレビューの良否を推定しない。
   const blocking = report.findings.some(f => ["critical", "high"].includes(f.severity));
-  const incomplete = !report.review_complete || report.limitations.length > 0 ||
-    report.checks.length === 0 || report.checks.some(c => c.status !== "passed");
+  const cited = new Set(evidenceBased ? report.assessments.flatMap(a => a.evidence_step_ids) : []);
+  const incomplete = !evidenceBased || !report.review_complete || report.limitations.length > 0 ||
+    report.assessments.length === 0 || report.assessments.some(a => !a.resolved) ||
+    report.not_run_checks.length > 0 ||
+    !report.investigation.some(step => step.tool === "get_pull_request_diff" && step.exit_code === 0) ||
+    report.investigation.some(step => step.exit_code !== 0 && !cited.has(step.id));
   let event = blocking ? "REQUEST_CHANGES" :
     (report.findings.length > 0 || incomplete ? "COMMENT" : "APPROVE");
 
@@ -94,7 +125,9 @@ async function publishReview({ github, context, core, reportJson, model, runAtte
   let body = renderReviewBody(renderOptions);
   if (Buffer.byteLength(body, "utf8") > 60000) {
     // 改行をJSONでエスケープし、出力内容がrunnerコマンドとして解釈されることを防ぐ。
-    for (const check of report.checks) core.info(`AI review check: ${JSON.stringify(check)}`);
+    for (const record of (report.investigation || report.checks)) {
+      core.info(`AI review observation: ${JSON.stringify(record)}`);
+    }
     body = renderReviewBody({ ...renderOptions, includeLogOutput: false });
   }
   requireValid(Buffer.byteLength(body, "utf8") <= 60000, "投稿本文のサイズ");
@@ -159,18 +192,31 @@ function renderReviewBody({
   const repoUrl = `${serverUrl}/${context.repo.owner}/${context.repo.repo}`;
   const runUrl = `${repoUrl}/actions/runs/${context.runId}`;
   const labels = { APPROVE: "承認", COMMENT: "コメント", REQUEST_CHANGES: "変更をリクエスト" };
-  const counts = { passed: 0, failed: 0, not_run: 0 };
-  for (const check of report.checks) counts[check.status]++;
 
   const sections = [
     "## AIコードレビュー", "",
-    `**${labels[event]}${incomplete ? " · 検証未完了" : ""}** · 指摘 ${report.findings.length}件`, "",
+    `**${labels[event]}${incomplete ? " · 調査未完了" : ""}** · 指摘 ${report.findings.length}件`, "",
     safe(report.summary), "",
-    `検証: 成功 ${counts.passed} / 失敗 ${counts.failed} / 未実行 ${counts.not_run}`,
   ];
-  if (incomplete) sections.push("", "未完了の調査・検証があるため、自動承認していません。");
+  if (incomplete) sections.push("", "未解決の調査、または根拠付きの評価の不足があるため、自動承認していません。");
   if (commentOnly) sections.push("", "Draftまたは同一BotによるPRのため、コメントとして投稿しています。");
   if (inlineCount > 0) sections.push("", `コード上のインラインコメント ${inlineCount}件を確認してください。`);
+
+  if (report.schema_version === 2) {
+    sections.push("", "### 変更内容の評価", "", safe(report.verification_rationale), "");
+    for (const assessment of report.assessments) {
+      const evidence = assessment.evidence_step_ids.length > 0
+        ? `観測 ${assessment.evidence_step_ids.join(", ")}` : "根拠未取得";
+      sections.push(`- <strong>${escapeHtml(assessment.question)}</strong> ` +
+        `${escapeHtml(assessment.conclusion)}（${assessment.resolved ? "確認済み" : "未解決"} · ${evidence}）`);
+    }
+    if (report.not_run_checks.length > 0) {
+      sections.push("", "### 未解決の検証", "",
+        ...report.not_run_checks.map(c => `- <code>${escapeHtml(c.command)}</code>: ${escapeHtml(c.result)}`));
+    }
+  } else {
+    sections.push("", "旧形式の実行記録には根拠付きの評価がないため、自動承認には使用していません。");
+  }
 
   for (const finding of fallbackFindings) {
     const path = finding.file.split("/").map(part => encodeURIComponent(part)
@@ -182,16 +228,16 @@ function renderReviewBody({
       "", safe(finding.body));
   }
   if (report.limitations.length > 0) {
-    sections.push("", "### 未確認の点", ...report.limitations.map(value => `- ${safe(value)}`));
+    sections.push("", "### 未確認の点", "", ...report.limitations.map(value => `- ${safe(value)}`));
   }
 
-  sections.push("", "<details>", `<summary>調査・検証の詳細（${report.checks.length}件）</summary>`, "");
+  sections.push("", "<details>", "<summary>調査ログ</summary>", "");
   if (includeLogOutput) {
-    const statusLabels = { passed: "✅ 成功", failed: "❌ 失敗", not_run: "⏭️ 未実行" };
-    for (const [index, check] of report.checks.entries()) {
-      sections.push(`#### ${index + 1}. ${statusLabels[check.status]}`, "",
-        "コマンド:", `<pre><code>${escapeHtml(check.command)}</code></pre>`, "",
-        "結果:", `<pre><code>${escapeHtml(check.result)}</code></pre>`, "");
+    for (const [index, record] of (report.investigation || report.checks).entries()) {
+      sections.push(`#### 観測 ${index + 1}`, "");
+      if (record.purpose) sections.push(escapeHtml(record.purpose), "");
+      sections.push("コマンド:", `<pre><code>${escapeHtml(record.command)}</code></pre>`, "",
+        "結果:", `<pre><code>${escapeHtml(record.result)}</code></pre>`, "");
     }
   } else {
     sections.push(`記録が長いため、詳細は[実行ログ](${runUrl})を参照してください。`, "");

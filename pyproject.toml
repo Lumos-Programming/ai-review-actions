@@ -1,6 +1,6 @@
 [project]
 name = "ynufes-ai-review-action"
-version = "1.1.0"
+version = "2.0.0"
 description = "Pydantic AIと分離サンドボックスによるPull RequestレビューAction"
 readme = "README.md"
 requires-python = ">=3.11"

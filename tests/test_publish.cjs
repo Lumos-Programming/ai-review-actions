@@ -21,6 +21,26 @@ function finding(severity = "high") {
   return { severity, title: "不具合", file: "src/example.ts", line: 1, body: "具体的な根拠" };
 }
 
+function evidenceReport(overrides = {}) {
+  return {
+    schema_version: 2,
+    reviewed_head_sha: "head123",
+    review_complete: true,
+    summary: "文書の意味を変えない変更です。",
+    limitations: [],
+    verification_rationale: "文言のみの変更で、差分の内容から判断できます。",
+    assessments: [{
+      question: "意味が変わっていないか。", conclusion: "意味は同じです。任意リンターは不要です。",
+      evidence_step_ids: [1, 2], resolved: true,
+    }],
+    investigation: [
+      { id: 1, tool: "get_pull_request_diff", purpose: "変更内容を確認する。", command: "git diff", exit_code: 0, result: "文言の変更" },
+      { id: 2, tool: "run_command", purpose: "任意ツールの有無を調べる。", command: "command -v linter", exit_code: 1, result: "ツールなし" },
+    ],
+    not_run_checks: [], findings: [], ...overrides,
+  };
+}
+
 function harness(value = report(), { latest = {}, previous = [], files = [] } = {}) {
   const submitted = [];
   const apiCalls = [];
@@ -57,12 +77,69 @@ function harness(value = report(), { latest = {}, previous = [], files = [] } = 
   return { run: () => publishReview(options), options, submitted, apiCalls, logs };
 }
 
+test("任意ツールの探索失敗ではなく根拠付きの評価で承認し、成功件数は表示しない", async () => {
+  const h = harness(evidenceReport());
+  assert.equal((await h.run()).event, "APPROVE");
+  const body = h.submitted[0].body;
+  const visible = body.replace(/<details>[\s\S]*?<\/details>/g, "");
+  assert.ok(!visible.includes("成功"));
+  assert.ok(!visible.includes("失敗"));
+  assert.ok(visible.includes("意味は同じです"));
+  assert.ok(visible.includes("文言のみの変更"));
+  assert.ok(body.includes("command -v linter"));
+});
+
+test("全コマンドの成功では承認せず、未解決の疑問や必要な検証を理由にコメントする", async () => {
+  for (const changes of [
+    { assessments: [] },
+    { assessments: [{ question: "互換性は維持されるか。", conclusion: "対象環境を再現できません。", evidence_step_ids: [1], resolved: false }] },
+    { not_run_checks: [{ command: "integration test", result: "変更した契約の検証が必要ですが、依存関係がありません。" }] },
+    { review_complete: false }, { limitations: ["関連実装を読み切れていません。"] },
+    { investigation: [] , assessments: [] },
+  ]) {
+    const h = harness(evidenceReport({
+      investigation: evidenceReport().investigation.map(step => ({ ...step, exit_code: 0 })),
+      ...changes,
+    }));
+    assert.equal((await h.run()).event, "COMMENT");
+  }
+});
+
+test("失敗の観測を解釈せずに完了と申告した場合は承認しない", async () => {
+  const h = harness(evidenceReport({ assessments: [{
+    question: "変更は安全か。", conclusion: "差分のみ確認しました。", evidence_step_ids: [1], resolved: true,
+  }] }));
+  assert.equal((await h.run()).event, "COMMENT");
+});
+
+test("修正要求は具体的な重大指摘だけから決まり、コマンド失敗だけでは要求しない", async () => {
+  for (const severity of ["critical", "high", "medium", "low"]) {
+    const h = harness(evidenceReport({ findings: [finding(severity)] }));
+    assert.equal((await h.run()).event, ["critical", "high"].includes(severity) ? "REQUEST_CHANGES" : "COMMENT");
+  }
+  const h = harness(evidenceReport({ review_complete: false }));
+  assert.equal((await h.run()).event, "COMMENT");
+});
+
+test("存在しない根拠・重複ID・根拠のない解決済み評価を投稿前に拒否する", async () => {
+  for (const evidence_step_ids of [[3], [1, 1], [], ["1"]]) {
+    const h = harness(evidenceReport({ assessments: [{
+      ...evidenceReport().assessments[0], evidence_step_ids,
+    }] }));
+    await assert.rejects(h.run(), /レビューJSONが不正/);
+    assert.deepEqual(h.apiCalls, []);
+  }
+  const h = harness(evidenceReport({ investigation: [evidenceReport().investigation[1]] }));
+  await assert.rejects(h.run(), /investigation.id/);
+  assert.deepEqual(h.apiCalls, []);
+});
+
 test("Unicodeの文字数をPydanticと揃え、上限内の絵文字を含む結果を投稿する", async () => {
   const result = "a".repeat(999) + "🎉";
   const h = harness(report({ checks: [{ command: "test", status: "passed", result }] }));
   const output = await h.run();
   assert.equal(output.published, true);
-  assert.equal(output.event, "APPROVE");
+  assert.equal(output.event, "COMMENT");
   assert.equal(h.submitted[0].commit_id, "head123");
   assert.ok(h.submitted[0].body.includes(result));
 });
@@ -81,9 +158,9 @@ test("上限を超える文字数や不正なレポートをAPI呼び出し前�
   }
 });
 
-test("使用上限の30件の検証記録を受け取る", async () => {
+test("旧形式の成功記録が30件あっても根拠付き評価なしでは承認しない", async () => {
   const h = harness(report({ checks: Array(30).fill({ command: "test", status: "passed", result: "ok" }) }));
-  assert.equal((await h.run()).event, "APPROVE");
+  assert.equal((await h.run()).event, "COMMENT");
 });
 
 test("重大な指摘は修正要求にし、軽微な指摘と未完了の調査はコメントにする", async () => {
@@ -137,7 +214,7 @@ test("投稿APIの失敗を呼び出し元へ伝える", async () => {
   await assert.rejects(h.run(), /permission denied/);
 });
 
-test("調査ログを既定で折りたたみ、本文は要約と検証件数だけにする", async () => {
+test("旧形式の調査ログも折りたたみ、検証の成功件数を本文に表示しない", async () => {
   const h = harness(report({
     checks: [
       { command: "git diff", status: "passed", result: "RAW_DIFF_CONTENT" },
@@ -147,12 +224,12 @@ test("調査ログを既定で折りたたみ、本文は要約と検証件数�
   await h.run();
   const body = h.submitted[0].body;
   const visible = body.replace(/<details>[\s\S]*?<\/details>/g, "");
-  assert.ok(visible.includes("成功 1 / 失敗 1 / 未実行 0"));
-  assert.ok(visible.includes("検証未完了"));
+  assert.ok(!visible.includes("成功 1 / 失敗 1 / 未実行 0"));
+  assert.ok(visible.includes("調査未完了"));
   assert.ok(!visible.includes("RAW_DIFF_CONTENT"));
   assert.ok(!visible.includes("RAW_ERROR_CONTENT"));
   assert.ok(body.includes("RAW_DIFF_CONTENT"));
-  assert.ok(body.includes("<summary>調査・検証の詳細（2件）</summary>"));
+  assert.ok(body.includes("<summary>調査ログ</summary>"));
 });
 
 test("ログ内のHTMLで折りたたみやレビューの表示を壊せない", async () => {
@@ -204,7 +281,7 @@ test("エスケープでログが大きくなる場合も投稿上限を守り�
   await h.run();
   assert.ok(Buffer.byteLength(h.submitted[0].body, "utf8") <= 60000);
   assert.ok(h.submitted[0].body.includes("記録が長いため"));
-  const records = h.logs.filter(line => line.startsWith("AI review check: "));
+  const records = h.logs.filter(line => line.startsWith("AI review observation: "));
   assert.equal(records.length, 30);
-  assert.equal(JSON.parse(records[0].slice("AI review check: ".length)).result, "&".repeat(1000));
+  assert.equal(JSON.parse(records[0].slice("AI review observation: ".length)).result, "&".repeat(1000));
 });

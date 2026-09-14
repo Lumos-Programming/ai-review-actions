@@ -6,10 +6,13 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from pydantic import ValidationError
+from pydantic_ai.messages import ModelResponse, RetryPromptPart, ToolCallPart, ToolReturnPart
+from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 
 SCRIPT = Path(__file__).parents[1] / "src" / "review.py"
@@ -69,13 +72,10 @@ class ReviewReportTest(unittest.TestCase):
             review_complete=False,
             summary="first line\nsecond line",
             limitations=["not enough time"],
-            checks=[
-                review.ReviewCheck(
-                    command="git diff --stat",
-                    status="passed",
-                    result="one file changed",
-                )
-            ],
+            investigation=[],
+            verification_rationale="not enough time",
+            assessments=[],
+            not_run_checks=[],
             findings=[],
         )
 
@@ -114,6 +114,149 @@ class ReviewPromptTest(unittest.TestCase):
         self.assertIn("ツール呼び出しは最大24回", prompt)
         self.assertIn("review_completeをfalse", prompt)
 
+    def test_next_investigation_step_uses_the_previous_sandbox_output(self) -> None:
+        class InvestigationSandbox(CheckoutSandbox):
+            def execute(self, command: list[str], timeout_seconds: int = 120):
+                if "diff" in command:
+                    return review.CommandResult(0, "changed-file: discovered.py", "")
+                if command[:2] == ["sed", "-n"]:
+                    return review.CommandResult(0, "reproduction: python3 reproduce.py", "")
+                if command == ["sh", "-lc", "python3 reproduce.py"]:
+                    return review.CommandResult(0, "base=correct; head=regression", "")
+                return super().execute(command, timeout_seconds)
+
+        turns = []
+
+        def respond(messages, info):
+            returns = [
+                part
+                for message in messages
+                for part in message.parts
+                if isinstance(part, ToolReturnPart)
+            ]
+            turns.append(len(returns))
+            if not returns:
+                return ModelResponse([ToolCallPart("get_pull_request_diff", {})])
+            content = str(returns[-1].content)
+            if len(returns) == 1:
+                self.assertIn("changed-file: discovered.py", content)
+                path = content.split("changed-file: ")[1].strip()
+                return ModelResponse([ToolCallPart("read_file", {"path": path})])
+            if len(returns) == 2:
+                self.assertIn("reproduction: python3 reproduce.py", content)
+                command = content.split("reproduction: ")[1].strip()
+                return ModelResponse(
+                    [
+                        ToolCallPart(
+                            "run_command",
+                            {
+                                "command": command,
+                                "purpose": "ファイルから得た再現手順で回帰を検証する。",
+                            },
+                        )
+                    ]
+                )
+            self.assertIn("base=correct; head=regression", content)
+            return ModelResponse(
+                [
+                    ToolCallPart(
+                        info.output_tools[0].name,
+                        {
+                            "review_complete": True,
+                            "summary": "差分から対象を特定し、再現結果を確認しました。",
+                            "limitations": [],
+                            "verification_rationale": "関連実装と再現で確認しました。",
+                            "assessments": [
+                                {
+                                    "question": "変更で回帰が起きるか。",
+                                    "conclusion": "Baseで正常、Headで回帰することを再現しました。",
+                                    "evidence_step_ids": [1, 2, 3],
+                                    "resolved": True,
+                                }
+                            ],
+                            "findings": [
+                                {
+                                    "severity": "high",
+                                    "title": "再現した回帰",
+                                    "file": "discovered.py",
+                                    "line": 1,
+                                    "body": "Baseでは正常、Headで回帰することを再現しました。",
+                                }
+                            ],
+                        },
+                    )
+                ]
+            )
+
+        report = review.review_pull_request(
+            self.config(), InvestigationSandbox(), model=FunctionModel(respond)
+        )
+        self.assertEqual(turns, [0, 1, 2, 3])
+        self.assertEqual(len(report.findings), 1)
+        self.assertTrue(report.review_complete)
+
+    def test_exploratory_probe_is_not_treated_as_required_verification(self) -> None:
+        class ProbeSandbox(CheckoutSandbox):
+            def execute(self, command: list[str], timeout_seconds: int = 120):
+                if command[:2] == ["sh", "-lc"]:
+                    return review.CommandResult(1, "", "optional linter is unavailable")
+                if "diff" in command:
+                    return review.CommandResult(0, "Only documentation wording changed.", "")
+                return super().execute(command, timeout_seconds)
+
+        def respond(messages, info):
+            returns = [
+                part
+                for message in messages
+                for part in message.parts
+                if isinstance(part, ToolReturnPart)
+            ]
+            if not returns:
+                return ModelResponse([ToolCallPart("get_pull_request_diff", {})])
+            if len(returns) == 1:
+                return ModelResponse(
+                    [
+                        ToolCallPart(
+                            "run_command",
+                            {
+                                "command": "command -v optional-linter",
+                                "purpose": "任意の文書リンターが利用できるか確認する。",
+                            },
+                        )
+                    ]
+                )
+            self.assertIn("optional linter is unavailable", str(returns[-1].content))
+            return ModelResponse(
+                [
+                    ToolCallPart(
+                        info.output_tools[0].name,
+                        {
+                            "review_complete": True,
+                            "summary": "文書の変更を確認しました。",
+                            "limitations": [],
+                            "findings": [],
+                            "verification_rationale": "文言だけの変更を差分で確認しました。",
+                            "assessments": [
+                                {
+                                    "question": "変更により文書の意味が変わっていないか。",
+                                    "conclusion": "意味の変更はなく、任意ツールは不要です。",
+                                    "evidence_step_ids": [1, 2],
+                                    "resolved": True,
+                                }
+                            ],
+                        },
+                    )
+                ]
+            )
+
+        report = review.review_pull_request(
+            self.config(), ProbeSandbox(), model=FunctionModel(respond)
+        )
+        self.assertTrue(report.review_complete)
+        self.assertEqual(report.not_run_checks, [])
+        self.assertEqual(report.investigation[1].exit_code, 1)
+        self.assertEqual(report.assessments[0].evidence_step_ids, [1, 2])
+
     def test_a_review_cannot_be_complete_without_recorded_investigation(self) -> None:
         model = TestModel(
             call_tools=[],
@@ -131,6 +274,95 @@ class ReviewPromptTest(unittest.TestCase):
         self.assertFalse(report.review_complete)
         self.assertEqual(report.reviewed_head_sha, "head456")
         self.assertIn("調査ツール", report.limitations[0])
+
+    def test_successful_commands_alone_do_not_complete_a_review(self) -> None:
+        model = TestModel(
+            call_tools=["get_pull_request_diff"],
+            custom_output_args={
+                "review_complete": True,
+                "summary": "コマンドは成功しました。",
+                "limitations": [],
+                "findings": [],
+            },
+        )
+        report = review.review_pull_request(self.config(), CheckoutSandbox(), model=model)
+        self.assertTrue(report.investigation)
+        self.assertTrue(all(step.exit_code == 0 for step in report.investigation))
+        self.assertFalse(report.review_complete)
+
+    def test_invalid_evidence_is_returned_to_the_model_for_correction(self) -> None:
+        def respond(messages, info):
+            returns = [
+                part
+                for message in messages
+                for part in message.parts
+                if isinstance(part, ToolReturnPart)
+            ]
+            if not returns:
+                return ModelResponse([ToolCallPart("get_pull_request_diff", {})])
+            retries = [
+                part
+                for message in messages
+                for part in message.parts
+                if isinstance(part, RetryPromptPart)
+            ]
+            if retries:
+                self.assertIn("実行済みstep_id", str(retries[-1].content))
+            return ModelResponse(
+                [
+                    ToolCallPart(
+                        info.output_tools[0].name,
+                        {
+                            "review_complete": True,
+                            "summary": "変更内容を確認しました。",
+                            "limitations": [],
+                            "findings": [],
+                            "verification_rationale": "文書の差分で判断できます。",
+                            "assessments": [
+                                {
+                                    "question": "文書の意味が変わるか。",
+                                    "conclusion": "表記のみの変更です。",
+                                    "evidence_step_ids": [1] if retries else [2],
+                                    "resolved": True,
+                                }
+                            ],
+                        },
+                    )
+                ]
+            )
+
+        report = review.review_pull_request(
+            self.config(), CheckoutSandbox(), model=FunctionModel(respond)
+        )
+        self.assertTrue(report.review_complete)
+        self.assertEqual(report.assessments[0].evidence_step_ids, [1])
+
+    def test_budget_exhaustion_preserves_observations_without_approval(self) -> None:
+        def respond(messages, info):
+            returns = [
+                part
+                for message in messages
+                for part in message.parts
+                if isinstance(part, ToolReturnPart)
+            ]
+            return ModelResponse(
+                [
+                    ToolCallPart(
+                        "read_file" if returns else "get_pull_request_diff",
+                        {"path": "README.md"} if returns else {},
+                    )
+                ]
+            )
+
+        report = review.review_pull_request(
+            replace(self.config(), tool_call_limit=1, investigation_tool_limit=1),
+            CheckoutSandbox(),
+            model=FunctionModel(respond),
+        )
+        self.assertFalse(report.review_complete)
+        self.assertEqual(len(report.investigation), 1)
+        self.assertTrue(report.limitations)
+        self.assertEqual(report.assessments, [])
 
     def test_rejects_a_checkout_at_a_different_head(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "does not match head-sha"):
@@ -156,8 +388,8 @@ class ReviewPromptTest(unittest.TestCase):
 
         report = review.review_pull_request(self.config(), CheckoutSandbox(), model=model)
 
-        self.assertEqual(report.checks[-1].status, "not_run")
-        self.assertEqual(report.checks[-1].command, "pnpm test")
+        self.assertFalse(report.review_complete)
+        self.assertEqual(report.not_run_checks[-1].command, "pnpm test")
 
 
 class ReviewConfigTest(unittest.TestCase):
@@ -183,7 +415,7 @@ class ReviewConfigTest(unittest.TestCase):
 
 
 class ReviewToolsTest(unittest.TestCase):
-    def test_diff_tool_uses_the_configured_commits_and_records_the_check(self) -> None:
+    def test_diff_tool_uses_the_configured_commits_and_records_the_observation(self) -> None:
         sandbox = FakeSandbox(review.CommandResult(exit_code=0, stdout="diff output", stderr=""))
         tools = review.ReviewTools(sandbox, base_sha="base123", head_sha="head456")
 
@@ -205,9 +437,9 @@ class ReviewToolsTest(unittest.TestCase):
                 )
             ],
         )
-        self.assertEqual(result, "[exit_code=0]\ndiff output")
-        self.assertEqual(tools.checks[0].status, "passed")
-        self.assertIn("base123...head456", tools.checks[0].command)
+        self.assertEqual(result, "[step_id=1]\n[exit_code=0]\ndiff output")
+        self.assertEqual(tools.steps[0].exit_code, 0)
+        self.assertIn("base123...head456", tools.steps[0].command)
 
     def test_file_tools_reject_paths_outside_the_workspace(self) -> None:
         sandbox = FakeSandbox(review.CommandResult(exit_code=0, stdout="unexpected", stderr=""))
