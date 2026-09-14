@@ -156,6 +156,8 @@ class DockerSandbox:
         self._started = False
 
     def __enter__(self) -> DockerSandbox:
+        user_id = os.getuid()
+        group_id = os.getgid()
         command = [
             "docker",
             "run",
@@ -170,15 +172,17 @@ class DockerSandbox:
             "no-new-privileges",
             "--pids-limit",
             "256",
+            "--user",
+            f"{user_id}:{group_id}",
             "--memory",
             "3g",
             "--cpus",
             "2",
             "--read-only",
             "--tmpfs",
-            "/tmp:rw,noexec,nosuid,nodev,size=256m",
+            f"/tmp:rw,noexec,nosuid,nodev,size=256m,uid={user_id},gid={group_id}",
             "--tmpfs",
-            "/workspace:rw,exec,nosuid,nodev,size=2g",
+            f"/workspace:rw,exec,nosuid,nodev,size=2g,uid={user_id},gid={group_id}",
             "--mount",
             f"type=bind,src={self._source_dir},dst=/source,readonly",
             "--workdir",
