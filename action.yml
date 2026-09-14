@@ -43,7 +43,7 @@ inputs:
     required: false
     default: "80"
   tool-call-limit:
-    description: 正常に実行できるツール呼び出しの上限（最大30）。
+    description: ツール呼び出しの上限（最大30）。
     required: false
     default: "30"
   investigation-tool-limit:
