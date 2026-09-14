@@ -21,7 +21,7 @@ function finding(severity = "high") {
   return { severity, title: "不具合", file: "src/example.ts", line: 1, body: "具体的な根拠" };
 }
 
-function harness(value = report(), { latest = {}, previous = [] } = {}) {
+function harness(value = report(), { latest = {}, previous = [], files = [] } = {}) {
   const submitted = [];
   const apiCalls = [];
   const pr = {
@@ -34,10 +34,15 @@ function harness(value = report(), { latest = {}, previous = [] } = {}) {
     reportJson: JSON.stringify(value), model: "gemini-test", runAttempt: "1",
     serverUrl: "https://github.com",
     github: {
-      paginate: async () => { apiCalls.push("list"); return previous; },
+      paginate: async (endpoint) => {
+        const isFiles = endpoint === options.github.rest.pulls.listFiles;
+        apiCalls.push(isFiles ? "files" : "list");
+        return isFiles ? files : previous;
+      },
       rest: {
         pulls: {
           listReviews() {},
+          listFiles() {},
           get: async () => { apiCalls.push("get"); return { data: { ...pr, ...latest } }; },
           createReview: async (request) => {
             apiCalls.push("create");
@@ -129,4 +134,73 @@ test("投稿APIの失敗を呼び出し元へ伝える", async () => {
   const h = harness();
   h.options.github.rest.pulls.createReview = async () => { throw new Error("permission denied"); };
   await assert.rejects(h.run(), /permission denied/);
+});
+
+test("調査ログを既定で折りたたみ、本文は要約と検証件数だけにする", async () => {
+  const h = harness(report({
+    checks: [
+      { command: "git diff", status: "passed", result: "RAW_DIFF_CONTENT" },
+      { command: "pnpm test", status: "failed", result: "RAW_ERROR_CONTENT" },
+    ],
+  }));
+  await h.run();
+  const body = h.submitted[0].body;
+  const visible = body.replace(/<details>[\s\S]*?<\/details>/g, "");
+  assert.ok(visible.includes("成功 1 / 失敗 1 / 未実行 0"));
+  assert.ok(visible.includes("検証未完了"));
+  assert.ok(!visible.includes("RAW_DIFF_CONTENT"));
+  assert.ok(!visible.includes("RAW_ERROR_CONTENT"));
+  assert.ok(body.includes("RAW_DIFF_CONTENT"));
+  assert.ok(body.includes("<summary>調査・検証の詳細（2件）</summary>"));
+});
+
+test("ログ内のHTMLで折りたたみやレビューの表示を壊せない", async () => {
+  const h = harness(report({
+    checks: [{ command: "echo '<details>'", status: "passed", result: "</details><h1>fake</h1>" }],
+  }));
+  await h.run();
+  const body = h.submitted[0].body;
+  assert.ok(body.includes("&lt;/details&gt;&lt;h1&gt;fake&lt;/h1&gt;"));
+  assert.equal((body.match(/<\/details>/g) || []).length, 1);
+});
+
+test("差分の新しい行に対応する指摘をインラインコメントにし、本文に重複させない", async () => {
+  const value = { ...finding(), line: 11 };
+  const h = harness(report({ findings: [value] }), {
+    files: [{ filename: "src/example.ts", patch: "@@ -10,2 +10,3 @@\n context\n-old\n+changed\n+added" }],
+  });
+  await h.run();
+  const request = h.submitted[0];
+  assert.deepEqual(request.comments, [{
+    path: "src/example.ts", line: 11, side: "RIGHT",
+    body: "**[high] 不具合**\n\n具体的な根拠",
+  }]);
+  assert.ok(!request.body.includes("具体的な根拠"));
+  assert.ok(request.body.includes("インラインコメント 1件"));
+  assert.deepEqual(h.apiCalls, ["list", "files", "get", "create"]);
+});
+
+test("差分外・削除ファイル・欠落したpatchの指摘は本文のコードリンクへフォールバックする", async () => {
+  for (const files of [
+    [],
+    [{ filename: "src/example.ts" }],
+    [{ filename: "src/example.ts", status: "removed", patch: "@@ -1 +0,0 @@\n-deleted" }],
+    [{ filename: "src/example.ts", patch: "@@ -10 +10 @@\n-old\n+new" }],
+  ]) {
+    const h = harness(report({ findings: [finding()] }), { files });
+    await h.run();
+    assert.equal(h.submitted[0].comments, undefined);
+    assert.ok(h.submitted[0].body.includes("具体的な根拠"));
+    const revision = files[0]?.status === "removed" ? "base123" : "head123";
+    assert.ok(h.submitted[0].body.includes(`https://github.com/org/repo/blob/${revision}/src/example.ts#L1`));
+  }
+});
+
+test("エスケープでログが大きくなる場合も投稿上限を守り、実行ログへ誘導する", async () => {
+  const h = harness(report({
+    checks: Array(30).fill({ command: "test", status: "passed", result: "&".repeat(1000) }),
+  }));
+  await h.run();
+  assert.ok(Buffer.byteLength(h.submitted[0].body, "utf8") <= 60000);
+  assert.ok(h.submitted[0].body.includes("記録が長いため"));
 });
