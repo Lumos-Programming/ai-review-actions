@@ -215,27 +215,10 @@ function renderReviewBody({
   const sections = [
     "## AIコードレビュー", "",
     `**${labels[event]}${incomplete ? " · 調査未完了" : ""}** · 指摘 ${report.findings.length}件`, "",
-    safe(report.summary), "",
+    incomplete ? "必要な検証が残っています。未確認事項を確認してください。" : safe(report.summary), "",
   ];
-  if (incomplete) sections.push("", "未解決の調査、または根拠付きの評価の不足があるため、自動承認していません。");
   if (commentOnly) sections.push("", "Draftまたは同一BotによるPRのため、コメントとして投稿しています。");
   if (inlineCount > 0) sections.push("", `コード上のインラインコメント ${inlineCount}件を確認してください。`);
-
-  if (report.schema_version === 2) {
-    sections.push("", "### 変更内容の評価", "", safe(report.verification_rationale), "");
-    for (const assessment of report.assessments) {
-      const evidence = assessment.evidence_step_ids.length > 0
-        ? `観測 ${assessment.evidence_step_ids.join(", ")}` : "根拠未取得";
-      sections.push(`- <strong>${escapeHtml(assessment.question)}</strong> ` +
-        `${escapeHtml(assessment.conclusion)}（${assessment.resolved ? "確認済み" : "未解決"} · ${evidence}）`);
-    }
-    if (report.not_run_checks.length > 0) {
-      sections.push("", "### 未解決の検証", "",
-        ...report.not_run_checks.map(c => `- <code>${escapeHtml(c.command)}</code>: ${escapeHtml(c.result)}`));
-    }
-  } else {
-    sections.push("", "旧形式の実行記録には根拠付きの評価がないため、自動承認には使用していません。");
-  }
 
   for (const finding of fallbackFindings) {
     const path = finding.file.split("/").map(part => encodeURIComponent(part)
@@ -246,11 +229,31 @@ function renderReviewBody({
       `<a href="${escapeHtml(codeUrl)}"><code>${escapeHtml(finding.file)}:L${finding.line}</code></a>`,
       "", safe(finding.body) + findingEvidence(finding));
   }
-  if (report.limitations.length > 0) {
-    sections.push("", "### 未確認の点", "", ...report.limitations.map(value => `- ${safe(value)}`));
+  const checks = report.not_run_checks || [];
+  if (checks.length > 0) {
+    sections.push("", "### 未確認", "",
+      ...checks.map(c => `- <code>${escapeHtml(c.command)}</code>: ${escapeHtml(c.result)}`));
+  } else if (report.limitations.length > 0) {
+    sections.push("", "### 未確認", "", ...report.limitations.map(value => `- ${safe(value)}`));
   }
 
   sections.push("", "<details>", "<summary>調査ログ</summary>", "");
+  if (incomplete) sections.push("### 調査メモ", "", escapeHtml(report.summary), "");
+  if (report.schema_version === 2) {
+    sections.push("### 評価と根拠", "", escapeHtml(report.verification_rationale), "");
+    for (const assessment of report.assessments) {
+      const evidence = assessment.evidence_step_ids.length > 0
+        ? `観測 ${assessment.evidence_step_ids.join(", ")}` : "根拠未取得";
+      sections.push(`- <strong>${escapeHtml(assessment.question)}</strong> ` +
+        `${escapeHtml(assessment.conclusion)}（${assessment.resolved ? "確認済み" : "未解決"} · ${evidence}）`);
+    }
+  } else {
+    sections.push("旧形式には根拠付きの評価がないため、自動承認しません。", "");
+  }
+  if (checks.length > 0 && report.limitations.length > 0) {
+    sections.push("", "### 制約の詳細", "", ...report.limitations.map(value => `- ${escapeHtml(value)}`));
+  }
+  sections.push("", "### 実行記録", "");
   if (includeLogOutput) {
     for (const [index, record] of (report.investigation || report.checks).entries()) {
       sections.push(`#### 観測 ${index + 1}`, "");

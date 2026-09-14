@@ -84,8 +84,9 @@ test("任意ツールの探索失敗ではなく根拠付きの評価で承認�
   const visible = body.replace(/<details>[\s\S]*?<\/details>/g, "");
   assert.ok(!visible.includes("成功"));
   assert.ok(!visible.includes("失敗"));
-  assert.ok(visible.includes("意味は同じです"));
-  assert.ok(visible.includes("文言のみの変更"));
+  assert.ok(body.includes("意味は同じです"));
+  assert.ok(body.includes("文言のみの変更"));
+  assert.ok(visible.includes("文書の意味を変えない変更です"));
   assert.ok(body.includes("command -v linter"));
 });
 
@@ -283,6 +284,29 @@ test("旧形式の調査ログも折りたたみ、検証の成功件数を本�
   assert.ok(!visible.includes("RAW_ERROR_CONTENT"));
   assert.ok(body.includes("RAW_DIFF_CONTENT"));
   assert.ok(body.includes("<summary>調査ログ</summary>"));
+});
+
+test("未完了レビューは短い未確認事項を表示し、長い評価と矛盾する完了宣言は折りたたむ", async () => {
+  const h = harness(evidenceReport({
+    summary: "レビューを完了しています。",
+    not_run_checks: [{ command: "pnpm lint && pnpm build", result: "依存関係の取得に失敗したため未実行です。" }],
+    limitations: ["ネットワーク接続の検証が必要です。"],
+    assessments: Array(5).fill({
+      question: "変更した実装と設定の整合性を確認できたか。",
+      conclusion: "静的に確認した内容と未確認の内容を区別する長い説明。".repeat(10),
+      evidence_step_ids: [1, 2], resolved: true,
+    }),
+  }));
+  const result = await h.run();
+  assert.equal(result.event, "COMMENT");
+  const body = h.submitted[0].body;
+  const visible = body.replace(/<details>[\s\S]*?<\/details>/g, "");
+  assert.ok(visible.length < 800);
+  assert.ok(visible.includes("pnpm lint"));
+  assert.ok(!visible.includes("レビューを完了"));
+  assert.ok(!visible.includes("静的に確認した内容"));
+  assert.ok(body.includes("静的に確認した内容"));
+  assert.ok(body.includes("ネットワーク接続の検証"));
 });
 
 test("ログ内のHTMLで折りたたみやレビューの表示を壊せない", async () => {

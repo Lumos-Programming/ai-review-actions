@@ -202,9 +202,12 @@ Appのインストール先や権限、秘密鍵が正しくない場合は失�
 
 ### 表示と判定
 
-本文には短い要約、指摘、変更内容の評価と根拠、未解決の懸念を表示します。
+本文には短い要約、指摘、未確認の検証だけを表示します。
 コマンドの成功・失敗件数は表示しません。
-調査コマンドと実行結果は折りたたみ、HTMLとして解釈されないコード表示にします。
+詳しい評価と根拠、調査コマンド、実行結果は「調査ログ」に折りたたみます。
+未完了の場合はモデルの完了宣言を本文へ出さず、検証が残ることを固定文で示します。
+要約と各評価の結論は240文字以内に制限し、同じ未確認事項を複数の節へ言い換えて並べないよう指示します。
+ログはHTMLとして解釈されないコード表示にします。
 表示用のエスケープで本文サイズが上限を超える場合は、各記録をJSON形式で実行ログへ明示的に
 出力し、本文の詳細をその実行ログへのリンクへ置き換えます。
 
@@ -239,7 +242,7 @@ GitHub ActionsによるPR承認を許可してください。GitHub App名義の
 ## v1からの移行
 
 調査Actionと投稿Actionを同じv2のコミットSHAへ更新してください。入力名・ジョブ分離・
-サンドボックスの権限は変更していません。JSON出力は`schema_version: 2`となり、旧`checks`を
+調査コンテナの権限削除とジョブ分離は維持しています。JSON出力は`schema_version: 2`となり、旧`checks`を
 `investigation`、`assessments`、`verification_rationale`、`not_run_checks`へ置き換えています。
 独自にJSONを読む処理がある場合は対応が必要です。
 
@@ -281,17 +284,43 @@ JSONが40 KBを超える場合は観測のコマンド・目的・結果の抜�
 オーケストレーターはGitHub Actionsホスト上で動作し、この処理だけに`GEMINI_API_KEY`を渡します。
 リポジトリ用ツールは、次の制約を設定したDockerコンテナで実行します。
 
-- ネットワーク接続なし
+- 既定ではネットワーク接続なし。`sandbox-network: public`で公開HTTP(S)通信を許可
 - Linux capabilityをすべて削除し、`no-new-privileges`を有効化
 - CPU、メモリ、プロセス数、コマンド実行時間を制限
 - checkoutは読み取り専用でマウント
 - テストと生成物には非公開の書き込み可能な`tmpfs`コピーを使用
 - GitHubやGeminiの認証情報をコンテナへ渡さない
 
-既定イメージはdigestへ固定した`node:22-bookworm`です。リポジトリが必要とする依存関係を含む
-事前構築済みイメージを`sandbox-image`で指定できます。サンドボックスにはネットワーク接続が
-ないため、レビュー中に不足パッケージをダウンロードすることはできません。上書きする場合も、
-供給元を信頼できるイメージをdigestへ固定してください。
+既定イメージは`sandbox/Dockerfile`から構築します。digestへ固定した`node:22-bookworm`に
+pnpm 12.3.4とactionlint 1.7.12を同梱し、actionlintの配布物はSHA-256も検証します。
+パッケージマネージャ用のホーム・キャッシュは、書き込みと実行が可能な専用tmpfsに配置します。
+読み取り専用のルートや`noexec`の`/tmp`へキャッシュを作って失敗することを防ぎます。
+
+依存関係や外部Actionの仕様を調べる場合は、調査Actionに次を追加します。
+
+```yaml
+with:
+  # ほかの必須入力は省略
+  sandbox-network: public
+```
+
+`public`では専用Dockerネットワークを作成し、公開IPv4宛てのTCP 80・443とコンテナ内の
+ループバック通信を許可します。ホスト、プライベート網、メタデータサービス等の宛先と外向きIPv6は拒否します。
+DNSはDockerの内部リゾルバーを使います。信頼する短命の補助コンテナだけに`NET_ADMIN`を付けて
+ネットワークルールを設定し、終了後にモデルへ調査ツールを公開します。調査コンテナ自身に
+`NET_ADMIN`は付与しません。設定に失敗した場合は処理を中止し、無制限の通信へ切り替えません。
+
+モデルは`package.json`やlockfileを確認し、必要な場合に`pnpm install --frozen-lockfile`などを
+サンドボックス内で実行します。依存関係の取得、lifecycle script、lint、buildはホスト上で実行しません。
+外部仕様は公式ドキュメントや固定リビジョンのソースで調べるよう指示します。
+`none`の場合は追加のパッケージ・プロジェクト指定のパッケージマネージャ等を取得できません。
+
+注意: `public`は宛先ドメインの許可リストではありません。悪意のあるコード・依存関係が公開サーバーへ
+checkoutの内容を送信するリスクは残ります。秘密鍵をコンテナへ渡さないこととは別のリスクなので、
+対象PRと依存関係を信頼できる場合に限って有効化してください。厳密な機密性が必要な対象は`none`を使用します。
+
+事前構築済みの独自イメージは`sandbox-image`で指定できます。`public`で使う場合は
+`sh`、`iptables`、`ip6tables`が必要です。イメージは信頼できる供給元のdigestへ固定してください。
 
 指定したActionリビジョンのコードは、権限を持つオーケストレーター内で実行されます。信頼できる
 コミットへ固定し、fork由来のワークフローへSecretを渡さず、レビュー対象のcheckoutでは
@@ -307,6 +336,8 @@ uv run ty check src tests
 uv run python tests/test_review.py
 node --test tests/test_publish.cjs
 RUN_DOCKER_TESTS=1 uv run python tests/test_review.py DockerSandboxTest
+docker build --tag ai-review-sandbox:dev sandbox
+RUN_DOCKER_TESTS=1 uv run python tests/test_environment.py
 ```
 
 投稿処理のテストにはNode.js 22以降、Dockerテストには起動中のDockerデーモンが必要です。

@@ -35,9 +35,13 @@ inputs:
     required: false
     default: .
   sandbox-image:
-    description: リポジトリ調査とテストコマンドに使用するDockerイメージ。
+    description: カスタムDockerイメージ。未指定時はpnpm・actionlintを含む既定イメージを構築します。
     required: false
-    default: node:22-bookworm@sha256:8a34c4ab3ea2c5cd194f07e317b2a8f09461d3c8b05c4e34c8ccd56d56024c4d
+    default: ""
+  sandbox-network:
+    description: noneは通信禁止、publicは公開HTTP(S)通信を許可。ホスト・プライベート網への通信は拒否します。
+    required: false
+    default: none
   request-limit:
     description: 出力検証の再試行を含むモデルリクエストの上限（最大80）。
     required: false
@@ -69,6 +73,25 @@ runs:
       shell: bash
       run: uv sync --frozen --no-dev --project "$GITHUB_ACTION_PATH"
 
+    - name: レビュー用Dockerイメージを準備
+      id: sandbox
+      shell: bash
+      env:
+        CUSTOM_IMAGE: ${{ inputs.sandbox-image }}
+        SANDBOX_NETWORK: ${{ inputs.sandbox-network }}
+      run: |
+        set -euo pipefail
+        if [[ "$SANDBOX_NETWORK" != "none" && "$SANDBOX_NETWORK" != "public" ]]; then
+          echo "::error::sandbox-network は none または public を指定してください。"
+          exit 1
+        fi
+        image="$CUSTOM_IMAGE"
+        if [[ -z "$image" ]]; then
+          image="ai-review-sandbox:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RANDOM}"
+          docker build --tag "$image" "$GITHUB_ACTION_PATH/sandbox"
+        fi
+        echo "image=$image" >> "$GITHUB_OUTPUT"
+
     - name: Pull Requestをレビュー
       id: review
       shell: bash
@@ -82,7 +105,8 @@ runs:
         REVIEW_BASE_SHA: ${{ inputs.base-sha }}
         REVIEW_HEAD_SHA: ${{ inputs.head-sha }}
         REVIEW_SOURCE_DIRECTORY: ${{ inputs.source-directory }}
-        REVIEW_SANDBOX_IMAGE: ${{ inputs.sandbox-image }}
+        REVIEW_SANDBOX_IMAGE: ${{ steps.sandbox.outputs.image }}
+        REVIEW_SANDBOX_NETWORK: ${{ inputs.sandbox-network }}
         REVIEW_REQUEST_LIMIT: ${{ inputs.request-limit }}
         REVIEW_TOOL_CALL_LIMIT: ${{ inputs.tool-call-limit }}
         REVIEW_INVESTIGATION_TOOL_LIMIT: ${{ inputs.investigation-tool-limit }}

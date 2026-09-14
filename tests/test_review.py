@@ -56,6 +56,19 @@ class ReviewReportTest(unittest.TestCase):
                     findings=[],
                 )
 
+    def test_model_output_is_concise(self) -> None:
+        with self.assertRaises(ValidationError):
+            review.ReviewDraft(
+                review_complete=False, summary="長" * 241, limitations=[], findings=[]
+            )
+        with self.assertRaises(ValidationError):
+            review.Assessment(
+                question="変更に回帰はあるか。",
+                conclusion="長" * 241,
+                evidence_step_ids=[1],
+                resolved=True,
+            )
+
     def test_rejects_a_finding_outside_the_repository(self) -> None:
         with self.assertRaises(ValidationError):
             review.Finding(
@@ -168,6 +181,11 @@ class ReviewPromptTest(unittest.TestCase):
         )
         self.assertIn("Write all user-facing review text in English", english_prompt)
         self.assertTrue(english_prompt.isascii())
+        public_prompt = review.build_review_prompt(replace(self.config(), sandbox_network="public"))
+        self.assertIn("Public outbound HTTP/HTTPS is available", public_prompt)
+        self.assertIn("frozen lockfile", public_prompt)
+        self.assertNotIn("lack of network access", public_prompt)
+        self.assertIn("Outbound network access is disabled", prompt)
 
     def test_next_investigation_step_uses_the_previous_sandbox_output(self) -> None:
         class InvestigationSandbox(CheckoutSandbox):
@@ -420,6 +438,58 @@ class ReviewPromptTest(unittest.TestCase):
         self.assertTrue(report.limitations)
         self.assertEqual(report.assessments, [])
 
+    def test_inconsistent_completion_is_returned_to_the_model(self) -> None:
+        def respond(messages, info):
+            returns = [
+                part
+                for message in messages
+                for part in message.parts
+                if isinstance(part, ToolReturnPart)
+            ]
+            if not returns:
+                return ModelResponse([ToolCallPart("get_pull_request_diff", {})])
+            retries = [
+                part
+                for message in messages
+                for part in message.parts
+                if isinstance(part, RetryPromptPart)
+            ]
+            if retries:
+                self.assertIn("review_complete=false", str(retries[-1].content))
+            return ModelResponse(
+                [
+                    ToolCallPart(
+                        info.output_tools[0].name,
+                        {
+                            "review_complete": not bool(retries),
+                            "summary": "ビルドが未検証です。",
+                            "limitations": [],
+                            "findings": [],
+                            "not_run_checks": [
+                                {
+                                    "command": "pnpm build",
+                                    "result": "依存関係の取得に失敗しました。",
+                                }
+                            ],
+                            "verification_rationale": "差分を確認しました。",
+                            "assessments": [
+                                {
+                                    "question": "ビルドできるか。",
+                                    "conclusion": "未検証です。",
+                                    "evidence_step_ids": [1],
+                                    "resolved": False,
+                                }
+                            ],
+                        },
+                    )
+                ]
+            )
+
+        report = review.review_pull_request(
+            self.config(), CheckoutSandbox(), model=FunctionModel(respond)
+        )
+        self.assertFalse(report.review_complete)
+
     def test_rejects_a_checkout_at_a_different_head(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "does not match head-sha"):
             review.review_pull_request(
@@ -449,6 +519,11 @@ class ReviewPromptTest(unittest.TestCase):
 
 
 class ReviewConfigTest(unittest.TestCase):
+    def test_rejects_unrestricted_network_modes(self) -> None:
+        for network in ["host", "bridge", "", "invalid"]:
+            with self.assertRaisesRegex(ValueError, "network must be none or public"):
+                review.DockerSandbox(Path("."), "node:test", network=network)
+
     def test_rejects_limits_above_the_action_ceiling(self) -> None:
         environment = {
             "REVIEW_REPOSITORY": "owner/repository",

@@ -16,18 +16,18 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Install uv
+      - name: uvを準備
         uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
 
-      - name: Check formatting and lint
+      - name: フォーマットとLintを検証
         run: uv run --frozen ruff format --check . && uv run --frozen ruff check .
 
-      - name: Type check
+      - name: 型を検証
         run: uv run --frozen ty check src tests
 
-      - name: Run unit tests
+      - name: ユニットテストを実行
         env:
           PYDANTIC_AI_NO_BANNER: "1"
         run: uv run --frozen python tests/test_review.py
@@ -35,8 +35,17 @@ jobs:
       - name: レビュー投稿処理をテスト
         run: node --test tests/test_publish.cjs
 
-      - name: Run Docker isolation test
+      - name: Dockerの分離を検証
         env:
           PYDANTIC_AI_NO_BANNER: "1"
           RUN_DOCKER_TESTS: "1"
         run: uv run --frozen python tests/test_review.py DockerSandboxTest
+
+      - name: 既定のレビュー環境を構築
+        run: docker build --tag ai-review-sandbox:dev sandbox
+
+      - name: pnpm・外部通信・ネットワーク分離を検証
+        env:
+          PYDANTIC_AI_NO_BANNER: "1"
+          RUN_DOCKER_TESTS: "1"
+        run: uv run --frozen python tests/test_environment.py
