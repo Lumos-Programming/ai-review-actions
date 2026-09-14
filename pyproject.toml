@@ -1,0 +1,26 @@
+[project]
+name = "ynufes-ai-review-action"
+version = "1.0.0"
+description = "A sandboxed Pydantic AI pull request review action"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+  "pydantic-ai-slim[google]==2.43.0",
+]
+
+[dependency-groups]
+dev = [
+  "ruff==0.16.7",
+  "ty==0.0.80",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.ty.environment]
+python-version = "3.11"

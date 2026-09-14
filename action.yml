@@ -1,0 +1,82 @@
+name: Pydantic AI PR Review
+description: Review a pull request with Gemini through Pydantic AI and an isolated Docker command sandbox.
+author: ynufes-tech
+
+branding:
+  icon: search
+  color: blue
+
+inputs:
+  gemini-api-key:
+    description: Gemini API key used by the Pydantic AI orchestrator.
+    required: true
+  model:
+    description: Gemini model name.
+    required: false
+    default: gemini-3.8-flash
+  repository:
+    description: Repository in owner/name form.
+    required: true
+  pull-request-number:
+    description: Pull request number being reviewed.
+    required: true
+  base-sha:
+    description: Pull request base commit SHA.
+    required: true
+  head-sha:
+    description: Pull request head commit SHA.
+    required: true
+  source-directory:
+    description: Checkout directory containing the pull request and its full Git history.
+    required: false
+    default: .
+  sandbox-image:
+    description: Docker image used for repository inspection and test commands.
+    required: false
+    default: node:22-bookworm
+  request-limit:
+    description: Maximum model requests, including output-validation retries.
+    required: false
+    default: "40"
+  tool-call-limit:
+    description: Hard maximum number of successfully executed tools.
+    required: false
+    default: "15"
+  investigation-tool-limit:
+    description: Lower tool budget stated in the prompt so the model reserves room for its final result.
+    required: false
+    default: "12"
+
+outputs:
+  report:
+    description: Validated JSON review report.
+    value: ${{ steps.review.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        enable-cache: true
+        cache-dependency-glob: ${{ github.action_path }}/uv.lock
+
+    - name: Review pull request
+      id: review
+      shell: bash
+      env:
+        GEMINI_API_KEY: ${{ inputs.gemini-api-key }}
+        PYDANTIC_AI_NO_BANNER: "1"
+        REVIEW_MODEL: ${{ inputs.model }}
+        REVIEW_REPOSITORY: ${{ inputs.repository }}
+        REVIEW_PULL_REQUEST_NUMBER: ${{ inputs.pull-request-number }}
+        REVIEW_BASE_SHA: ${{ inputs.base-sha }}
+        REVIEW_HEAD_SHA: ${{ inputs.head-sha }}
+        REVIEW_SOURCE_DIRECTORY: ${{ inputs.source-directory }}
+        REVIEW_SANDBOX_IMAGE: ${{ inputs.sandbox-image }}
+        REVIEW_REQUEST_LIMIT: ${{ inputs.request-limit }}
+        REVIEW_TOOL_CALL_LIMIT: ${{ inputs.tool-call-limit }}
+        REVIEW_INVESTIGATION_TOOL_LIMIT: ${{ inputs.investigation-tool-limit }}
+      run: >-
+        uv run --frozen --project "$GITHUB_ACTION_PATH"
+        python "$GITHUB_ACTION_PATH/src/review.py"
