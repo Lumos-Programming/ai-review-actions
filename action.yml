@@ -1,5 +1,5 @@
-name: Pydantic AI PR Review
-description: Review a pull request with Gemini through Pydantic AI and an isolated Docker command sandbox.
+name: Pydantic AI PRレビュー
+description: Pydantic AI経由のGeminiと分離されたDockerサンドボックスでPull Requestをレビューします。
 author: ynufes-tech
 
 branding:
@@ -8,66 +8,75 @@ branding:
 
 inputs:
   gemini-api-key:
-    description: Gemini API key used by the Pydantic AI orchestrator.
+    description: Pydantic AIのオーケストレーターが使用するGemini APIキー。
     required: true
   model:
-    description: Gemini model name.
+    description: 使用するGeminiモデル名。
     required: false
     default: gemini-3.8-flash
+  review-language:
+    description: 要約、制約、指摘の記述言語。
+    required: false
+    default: 日本語
   repository:
-    description: Repository in owner/name form.
+    description: owner/name形式の対象リポジトリ。
     required: true
   pull-request-number:
-    description: Pull request number being reviewed.
+    description: レビュー対象のPull Request番号。
     required: true
   base-sha:
-    description: Pull request base commit SHA.
+    description: Pull RequestのBaseコミットSHA。
     required: true
   head-sha:
-    description: Pull request head commit SHA.
+    description: Pull RequestのHeadコミットSHA。
     required: true
   source-directory:
-    description: Checkout directory containing the pull request and its full Git history.
+    description: Pull Requestと完全なGit履歴を含むcheckoutディレクトリ。
     required: false
     default: .
   sandbox-image:
-    description: Docker image used for repository inspection and test commands.
+    description: リポジトリ調査とテストコマンドに使用するDockerイメージ。
     required: false
-    default: node:22-bookworm
+    default: node:22-bookworm@sha256:8a34c4ab3ea2c5cd194f07e317b2a8f09461d3c8b05c4e34c8ccd56d56024c4d
   request-limit:
-    description: Maximum model requests, including output-validation retries.
+    description: 出力検証の再試行を含むモデルリクエストの上限（最大80）。
     required: false
-    default: "40"
+    default: "80"
   tool-call-limit:
-    description: Hard maximum number of successfully executed tools.
+    description: 正常に実行できるツール呼び出しの上限（最大30）。
     required: false
-    default: "15"
+    default: "30"
   investigation-tool-limit:
-    description: Lower tool budget stated in the prompt so the model reserves room for its final result.
+    description: 最終結果の生成余力を残すため、プロンプトでモデルに指示する調査ツールの上限（最大24）。
     required: false
-    default: "12"
+    default: "24"
 
 outputs:
   report:
-    description: Validated JSON review report.
+    description: 検証済みJSONレビュー結果。
     value: ${{ steps.review.outputs.report }}
 
 runs:
   using: composite
   steps:
-    - name: Install uv
+    - name: uvをインストール
       uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       with:
         enable-cache: true
         cache-dependency-glob: ${{ github.action_path }}/uv.lock
 
-    - name: Review pull request
+    - name: 依存関係をインストール
+      shell: bash
+      run: uv sync --frozen --no-dev --project "$GITHUB_ACTION_PATH"
+
+    - name: Pull Requestをレビュー
       id: review
       shell: bash
       env:
         GEMINI_API_KEY: ${{ inputs.gemini-api-key }}
         PYDANTIC_AI_NO_BANNER: "1"
         REVIEW_MODEL: ${{ inputs.model }}
+        REVIEW_LANGUAGE: ${{ inputs.review-language }}
         REVIEW_REPOSITORY: ${{ inputs.repository }}
         REVIEW_PULL_REQUEST_NUMBER: ${{ inputs.pull-request-number }}
         REVIEW_BASE_SHA: ${{ inputs.base-sha }}
@@ -77,6 +86,4 @@ runs:
         REVIEW_REQUEST_LIMIT: ${{ inputs.request-limit }}
         REVIEW_TOOL_CALL_LIMIT: ${{ inputs.tool-call-limit }}
         REVIEW_INVESTIGATION_TOOL_LIMIT: ${{ inputs.investigation-tool-limit }}
-      run: >-
-        uv run --frozen --project "$GITHUB_ACTION_PATH"
-        python "$GITHUB_ACTION_PATH/src/review.py"
+      run: exec "$GITHUB_ACTION_PATH/.venv/bin/python" "$GITHUB_ACTION_PATH/src/review.py"

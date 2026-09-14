@@ -1,7 +1,7 @@
 [project]
 name = "ynufes-ai-review-action"
 version = "1.0.0"
-description = "A sandboxed Pydantic AI pull request review action"
+description = "Pydantic AIと分離サンドボックスによるPull RequestレビューAction"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

@@ -1,13 +1,14 @@
 # AI Review Actions
 
-`ynufes-tech/ai-review-actions` reviews pull requests with Gemini through
-[Pydantic AI](https://github.com/pydantic/pydantic-ai). The model can inspect the checkout and run
-focused commands, but those operations execute in a disposable Docker sandbox rather than in the
-orchestrator process that holds the Gemini API key.
+`ynufes-tech/ai-review-actions`は、[Pydantic AI](https://github.com/pydantic/pydantic-ai)
+経由のGeminiを使ってPull RequestをレビューするGitHub Actionです。モデルによるcheckoutの
+調査やコマンド実行は、Gemini APIキーを保持するオーケストレーターではなく、使い捨ての
+Dockerサンドボックス内で行います。
 
-## Usage
+## 使い方
 
-The checkout must contain both the base and head commits.
+checkoutにはBaseとHeadの両方のコミットが必要です。次の例のActionリビジョンは説明用です。
+本番ワークフローでは、検証済みの完全なコミットSHAへ固定してください。
 
 ```yaml
 jobs:
@@ -37,72 +38,72 @@ jobs:
           source-directory: source
 ```
 
-For production workflows, pin the action to a full commit SHA rather than a movable major-version
-tag.
+レビュー文の既定言語は日本語です。別の言語が必要な場合は`review-language`を指定してください。
 
-## Output
+## 出力
 
-The `report` output is a JSON object with this shape:
+`report`出力は次の形式のJSONオブジェクトです。
 
 ```json
 {
   "schema_version": 1,
-  "reviewed_head_sha": "commit SHA",
+  "reviewed_head_sha": "コミットSHA",
   "review_complete": true,
-  "summary": "Japanese review summary",
+  "summary": "レビューの要約",
   "limitations": [],
   "checks": [
     {
       "command": "git diff base...head",
       "status": "passed",
-      "result": "recorded command result"
+      "result": "記録されたコマンド結果"
     }
   ],
   "findings": [
     {
       "severity": "high",
-      "title": "finding title",
+      "title": "指摘のタイトル",
       "file": "relative/path.ts",
       "line": 10,
-      "body": "problem, impact, evidence, and suggested fix"
+      "body": "問題、影響、根拠、修正案"
     }
   ]
 }
 ```
 
-The action constructs `reviewed_head_sha` itself and records checks from executed tools rather than
-trusting the model to report them. Pydantic validates all other fields before the output is exposed.
+Actionはcheckoutが指定されたHead SHAと一致することを検証し、`reviewed_head_sha`を自身で
+設定します。実行済みの`checks`もモデルの申告を信用せず、ツールの実行結果から記録します。
+必要だが実行できなかった検証は、モデルが`not_run`として申告し、Pydanticで検証します。
 
-## Limits
+## 使用上限
 
-The defaults allow 40 model requests and 15 successful tool calls. The prompt asks the model to stop
-after 12 investigation calls, preserving capacity for a validated final result. If Pydantic AI
-enforces a usage limit first, the action returns an incomplete report instead of discarding all
-investigation evidence.
+既定値では、モデルリクエストを80回、正常なツール呼び出しを30回まで許可します。モデルには
+調査ツールを24回までに抑えるよう指示し、検証済みの最終結果を生成する余力を残します。
+先にPydantic AIの使用上限へ到達した場合は、調査結果をすべて破棄せず未完了のレポートを返します。
 
-Inputs can override `request-limit`, `tool-call-limit`, and `investigation-tool-limit`.
+`request-limit`、`tool-call-limit`、`investigation-tool-limit`では、これらの上限を引き下げられます。
 
-## Sandbox model
+## サンドボックス
 
-The orchestrator runs on the GitHub Actions host and is the only process given `GEMINI_API_KEY`.
-Repository tools run in a Docker container configured with:
+オーケストレーターはGitHub Actionsホスト上で動作し、この処理だけに`GEMINI_API_KEY`を渡します。
+リポジトリ用ツールは、次の制約を設定したDockerコンテナで実行します。
 
-- no network;
-- all Linux capabilities dropped and `no-new-privileges` enabled;
-- CPU, memory, process, and command-time limits;
-- a read-only mount of the checkout;
-- a private writable `tmpfs` copy for tests and generated files;
-- no GitHub or Gemini credentials injected into the container.
+- ネットワーク接続なし
+- Linux capabilityをすべて削除し、`no-new-privileges`を有効化
+- CPU、メモリ、プロセス数、コマンド実行時間を制限
+- checkoutは読み取り専用でマウント
+- テストと生成物には非公開の書き込み可能な`tmpfs`コピーを使用
+- GitHubやGeminiの認証情報をコンテナへ渡さない
 
-The default image is `node:22-bookworm`. Override `sandbox-image` with a prebuilt image containing
-the dependencies required by the repository. The sandbox has no network, so it cannot download
-missing packages during a review.
+既定イメージはdigestへ固定した`node:22-bookworm`です。リポジトリが必要とする依存関係を含む
+事前構築済みイメージを`sandbox-image`で指定できます。サンドボックスにはネットワーク接続が
+ないため、レビュー中に不足パッケージをダウンロードすることはできません。上書きする場合も、
+供給元を信頼できるイメージをdigestへ固定してください。
 
-This action executes code from the referenced action revision in the privileged orchestrator. Pin a
-trusted commit, do not expose secrets to workflows from forks, and use `persist-credentials: false`
-for the reviewed checkout.
+指定したActionリビジョンのコードは、権限を持つオーケストレーター内で実行されます。信頼できる
+コミットへ固定し、fork由来のワークフローへSecretを渡さず、レビュー対象のcheckoutでは
+`persist-credentials: false`を使用してください。
 
-## Development
+## 開発
 
 ```bash
 uv sync --frozen
@@ -113,4 +114,4 @@ uv run python tests/test_review.py
 RUN_DOCKER_TESTS=1 uv run python tests/test_review.py DockerSandboxTest
 ```
 
-The Docker test requires a running Docker daemon.
+Dockerテストには、起動中のDockerデーモンが必要です。
