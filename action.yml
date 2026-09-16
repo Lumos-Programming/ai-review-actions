@@ -42,6 +42,14 @@ inputs:
     description: noneは通信禁止、publicは公開HTTP(S)通信を許可。ホスト・プライベート網への通信は拒否します。
     required: false
     default: none
+  mcp-servers:
+    description: 外部文書・Issueの参照に使うHTTPS MCPサーバーのJSON配列。接続先・説明・許可する読み取りツールを指定します。
+    required: false
+    default: "[]"
+  mcp-headers:
+    description: MCPサーバー名をキーにしたHTTPヘッダーのJSON。認証情報はSecretsから渡し、サンドボックスには渡しません。
+    required: false
+    default: "{}"
   request-limit:
     description: 出力検証の再試行を含むモデルリクエストの上限（最大80）。
     required: false
@@ -107,6 +115,8 @@ runs:
         REVIEW_SOURCE_DIRECTORY: ${{ inputs.source-directory }}
         REVIEW_SANDBOX_IMAGE: ${{ steps.sandbox.outputs.image }}
         REVIEW_SANDBOX_NETWORK: ${{ inputs.sandbox-network }}
+        REVIEW_MCP_SERVERS: ${{ inputs.mcp-servers }}
+        REVIEW_MCP_HEADERS: ${{ inputs.mcp-headers }}
         REVIEW_REQUEST_LIMIT: ${{ inputs.request-limit }}
         REVIEW_TOOL_CALL_LIMIT: ${{ inputs.tool-call-limit }}
         REVIEW_INVESTIGATION_TOOL_LIMIT: ${{ inputs.investigation-tool-limit }}

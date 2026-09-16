@@ -77,6 +77,24 @@ function harness(value = report(), { latest = {}, previous = [], files = [] } = 
   return { run: () => publishReview(options), options, submitted, apiCalls, logs };
 }
 
+test("MCPの外部根拠を検証して調査ログに表示する", async () => {
+  const value = evidenceReport();
+  value.investigation[1] = {
+    id: 2, tool: "external_context", purpose: "対象版の公式文書を確認する。",
+    command: 'mcp docs/query-docs {"libraryId":"/example/v2"}', exit_code: 0,
+    result: "https://docs.example.com/v2: documented behavior",
+  };
+  const h = harness(value);
+  assert.equal((await h.run()).event, "APPROVE");
+  assert.ok(h.submitted[0].body.includes("mcp docs/query-docs"));
+  assert.ok(h.submitted[0].body.includes("https://docs.example.com/v2"));
+
+  value.assessments[0].evidence_step_ids = [1];
+  assert.equal((await harness(value).run()).event, "COMMENT");
+  value.investigation[1].tool = "unrecognized_mcp_tool";
+  await assert.rejects(harness(value).run(), /investigation.tool/);
+});
+
 test("任意ツールの探索失敗ではなく根拠付きの評価で承認し、成功件数は表示しない", async () => {
   const h = harness(evidenceReport());
   assert.equal((await h.run()).event, "APPROVE");

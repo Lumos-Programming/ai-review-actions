@@ -44,7 +44,7 @@ async function publishReview({ github, context, core, reportJson, model, runAtte
     requireValid(array(report.investigation, 30), "investigation");
     requireValid(array(report.assessments, 8), "assessments");
     requireValid(array(report.not_run_checks, 6), "not_run_checks");
-    const toolNames = ["get_pull_request_diff", "list_directory", "read_file", "search_text", "run_command"];
+    const toolNames = ["get_pull_request_diff", "list_directory", "read_file", "search_text", "run_command", "external_context"];
     for (const [index, step] of report.investigation.entries()) {
       requireValid(object(step) && step.id === index + 1, "investigation.id");
       requireValid(toolNames.includes(step.tool) && Number.isInteger(step.exit_code), "investigation.tool/exit_code");
