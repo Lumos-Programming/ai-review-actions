@@ -16,6 +16,7 @@ from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 
 SCRIPT = Path(__file__).parents[1] / "src" / "review.py"
+sys.path.insert(0, str(SCRIPT.parent))
 SPEC = importlib.util.spec_from_file_location("review", SCRIPT)
 assert SPEC and SPEC.loader
 review = importlib.util.module_from_spec(SPEC)

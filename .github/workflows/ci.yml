@@ -30,7 +30,7 @@ jobs:
       - name: ユニットテストを実行
         env:
           PYDANTIC_AI_NO_BANNER: "1"
-        run: uv run --frozen python tests/test_review.py
+        run: uv run --frozen python -m unittest discover -s tests
 
       - name: レビュー投稿処理をテスト
         run: node --test tests/test_publish.cjs

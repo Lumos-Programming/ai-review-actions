@@ -255,7 +255,22 @@ Pydantic AIは「モデルがツールを選ぶ → サンドボックスで実�
 次の調査を選ぶ」を最終レポートまで繰り返します。コマンド一覧を一度生成して実行するだけの
 構成ではありません。同じworkspaceを操作するツールは直列実行します。
 
+ファイルの閲覧・一覧・文字列検索には専用ツールを使うよう指示しています。モデルが
+`cat`や`sed`などのシェルコマンドを書く必要はありません。
+
+| 操作 | ツール | 指定例 |
+| --- | --- | --- |
+| ファイルを読む | `read_file` | `path="src/app.py", start_line=1, end_line=200` |
+| ファイルの所在を調べる | `list_directory` | `path="src", depth=2` |
+| 文字列を検索する | `search_text` | `pattern="handle_request", path="src"` |
+
+`read_file`の行番号は1始まりで、開始行と終了行を含めて一度に400行まで取得できます。
+続きは`start_line=401, end_line=800`のように両方の行番号を指定します。
+内部ではDocker内の`sed`等を使い、テストや生成物と同じworkspaceを調べます。
+そのため、専用ツールを使った場合も調査ログの`command`には内部の実行コマンドが残ります。
+
 `run_command`では調べたい疑問とコマンドを選んだ理由を`purpose`として指定します。
+テスト・再現・依存関係の準備など、専用ツールで対応できない操作に使用します。
 モデルは利用可能なツール・依存関係・制約を考慮して、実行が必要か、静的調査や代替手段で
 判断できるかを評価します。出力を見てから関連ファイルを読む、再現条件を絞る、Baseと比較するなど、
 観測に応じて次の操作を選ぶよう指示しています。
@@ -267,6 +282,95 @@ Pydantic AIは「モデルがツールを選ぶ → サンドボックスで実�
 任意ツールの失敗と必要な未解決の検証を区別することを確認しています。
 JSONが40 KBを超える場合は観測のコマンド・目的・結果の抜粋だけを短縮し、観測ID、指摘、
 評価は保持します。指摘や評価自体が大きすぎる場合は、内容を捨てて投稿せず明示的に失敗します。
+
+## MCPによる文書・Issueの参照
+
+`mcp-servers`を指定すると、モデルが外部の文書やIssueを専用のMCPツールで参照できます。
+コードは既存の`read_file`等で読み、外部情報と照合します。既定では外部MCP接続はありません。
+
+次の例は[Context7](https://github.com/upstash/context7)のライブラリ文書検索と、
+[GitHub MCP](https://github.com/github/github-mcp-server)のPR・Issue参照を有効にします。
+調査Actionと`publish`は、この機能に対応した同じコミットSHAへ更新してください。
+
+```yaml
+with:
+  # ほかの必須入力は省略
+  mcp-servers: |
+    [
+      {
+        "name": "docs",
+        "url": "https://mcp.context7.com/mcp",
+        "description": "Find library documentation. Resolve the library first, then check the installed version and source URL.",
+        "allowed_tools": ["resolve-library-id", "query-docs"]
+      },
+      {
+        "name": "github",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "description": "Read the target PR and linked issues to compare requirements with the implementation. Search the target repository first.",
+        "allowed_tools": ["pull_request_read", "issue_read", "search_issues"]
+      }
+    ]
+  mcp-headers: ${{ secrets.AI_REVIEW_MCP_HEADERS }}
+```
+
+Repository Secretの`AI_REVIEW_MCP_HEADERS`には、次の形式のJSONを登録します。
+認証情報は例の文字列を実際の値へ置き換えてください。
+
+```json
+{
+  "docs": {
+    "Authorization": "Bearer CONTEXT7_API_KEY"
+  },
+  "github": {
+    "Authorization": "Bearer GITHUB_MCP_READ_TOKEN",
+    "X-MCP-Readonly": "true",
+    "X-MCP-Tools": "pull_request_read,issue_read,search_issues"
+  }
+}
+```
+
+GitHubには、対象リポジトリのIssues・Pull requestsを読める調査専用のトークンを使用します。
+投稿用トークンとは分けてください。GitHub公式のリモートMCPはPAT認証を案内しています。
+認証・利用条件は[リモートMCPの公式説明](https://github.com/github/github-mcp-server#remote-github-mcp-server)、
+ヘッダーの設定は[リモートサーバーの設定資料](https://github.com/github/github-mcp-server/blob/main/docs/remote-server.md)
+で確認してください。Context7だけを使う場合は、両方のJSONから`github`の設定を外せます。
+
+### 調査と根拠
+
+モデルへは`mcp_docs_query-docs`のようにサーバー名を付けたツールを公開します。
+ライブラリの識別・文書検索・PRやIssueの取得を、直前の結果を見ながら選びます。
+ローカルのpackage metadataやlockfileで対象バージョンを確認し、外部文書の出典と適用範囲を
+確認するよう指示しています。Context7の検索結果すべてが公式文書とは限りません。
+PRの説明から関連Issueをたどり、その要件・受け入れ条件と実装を照合します。
+
+取得結果は`investigation`の`tool: "external_context"`として、コード調査と同じ観測IDで
+記録します。`command`には`mcp サーバー名/ツール名 引数JSON`を記載します。
+`exit_code`はMCP呼び出しの成功を`0`、失敗を`1`で表す互換用の値で、シェルの終了コードではありません。
+引用した観測IDと出典URLを評価・指摘へ記載するよう指示し、投稿側も外部の観測IDを検証します。
+
+MCP呼び出しは既存の調査回数上限を共有し、1回30秒、結果は約20,000文字に制限します。
+ツール呼び出しの失敗も観測として返し、モデルが代替手段や未確認事項を判断できます。
+設定不備、初期接続・ツール一覧取得の失敗、指定したツールの欠落は、ジョブを明示的に失敗させます。
+
+### 接続設定の扱い
+
+接続先は信頼するワークフローのAction入力で指定し、レビュー対象の設定ファイルからは読みません。
+HTTPSのStreamable HTTPに対応します。stdioでのプログラム起動、設定中の環境変数展開、
+URL内の認証情報・クエリ・フラグメントには対応しません。
+サーバーは最大4個、許可ツールは各8個・合計16個です。
+
+`allowed_tools`には管理者が読み取り用途を確認したツール名だけを列挙してください。
+一覧にないツールと、サーバーが`readOnlyHint: false`と明示したツールは公開しません。
+注釈だけでは実際の動作を保証できないため、接続先自体とトークンの権限も限定します。
+サーバーからの初期指示はシステム指示に取り込まず、文書・Issue本文も調査資料として扱います。
+
+MCPはオーケストレーターから接続するため、`sandbox-network: none`でも利用できます。
+サンドボックスのネットワーク設定は引き続きコンテナ内のコマンドに適用されます。
+MCPの認証ヘッダーをモデルの引数やコンテナへ渡しません。
+設定した認証情報がツール定義に含まれている場合は、モデルへ渡す前に処理を停止します。
+応答・エラー内の認証情報はマスキングし、MCP接続中は生の応答を含み得るSDKの通信ログを抑止します。
+モデルが選んだ検索文・リポジトリ名・Issue番号等は接続先へ送られるため、利用を認めるサーバーだけを設定してください。
+ソースコードや差分を検索文として送らないよう指示しています。
 
 ## 使用上限
 
@@ -333,7 +437,7 @@ uv sync --frozen
 uv run ruff format --check .
 uv run ruff check .
 uv run ty check src tests
-uv run python tests/test_review.py
+uv run python -m unittest discover -s tests
 node --test tests/test_publish.cjs
 RUN_DOCKER_TESTS=1 uv run python tests/test_review.py DockerSandboxTest
 docker build --tag ai-review-sandbox:dev sandbox
